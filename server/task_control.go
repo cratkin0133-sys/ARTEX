@@ -249,7 +249,7 @@ func (s *Server) controlTasksBatch(w http.ResponseWriter, r *http.Request) {
 		TaskIDs []string `json:"task_ids"`
 		Action  string   `json:"action"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decode(w, r, &req); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())
 		return
 	}

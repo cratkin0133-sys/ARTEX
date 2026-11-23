@@ -1270,7 +1270,7 @@ func (s *Server) setActive(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ID string `json:"id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decode(w, r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -1296,7 +1296,7 @@ func (s *Server) control(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Action string `json:"action"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decode(w, r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -1337,7 +1337,7 @@ func (s *Server) controlIntent(w http.ResponseWriter, r *http.Request) {
 		Reason string `json:"reason"` // required for cancel (delete): deletion reason
 		Mode   string `json:"mode"`   // cancel only: soft (default, soft delete) | hard (real delete, cascades away exclusively-owned descendants)
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decode(w, r, &req); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())
 		return
 	}
@@ -1494,7 +1494,7 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 		ThinkingType    string  `json:"thinking_type"`
 		ReasoningEffort string  `json:"reasoning_effort"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decode(w, r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -1560,7 +1560,7 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 		SessionHeaderKey string `json:"session_header_key"` // non-empty = the test also sends this custom session header, with a one-off random session id as the value
 		UserAgent        string `json:"user_agent"`         // non-empty = the test overrides the User-Agent header with this value (mirrors production)
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decode(w, r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -1747,7 +1747,7 @@ type taskCredentialReq struct {
 
 func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	var req createTaskReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decode(w, r, &req); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())
 		return
 	}
@@ -1868,7 +1868,7 @@ func (s *Server) updateTaskLLMProfiles(w http.ResponseWriter, r *http.Request) {
 		ActiveLLMProfileID *int64  `json:"active_llm_profile_id"`
 		LLMRotate          *bool   `json:"llm_rotate"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decode(w, r, &req); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())
 		return
 	}
@@ -2179,7 +2179,7 @@ func (s *Server) taskScopeAdd(w http.ResponseWriter, r *http.Request) {
 		Value  string `json:"value"`
 		Reason string `json:"reason"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decode(w, r, &body); err != nil {
 		writeErr(w, 400, "invalid JSON")
 		return
 	}
@@ -2591,7 +2591,7 @@ func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 		Name        *string `json:"name"`
 		VulnClass   *string `json:"vulnclass"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decode(w, r, &body); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())
 		return
 	}
@@ -2599,85 +2599,37 @@ func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "nothing to update: provide status/severity/name/vulnclass/report_state")
 		return
 	}
-	if body.Status != nil {
-		if !db.ValidFindingStatus(*body.Status) {
-			writeErr(w, 400, "bad status: "+*body.Status)
-			return
-		}
-		// Use the notifying variant: the status update and the "status-change push event" land in the same transaction,
-		// avoiding a window where the status changed but the push event was lost. Event-registration failure does not affect the status update,
-		// so it is only logged, not reported to the caller.
-		from, found, notified, err := s.m.pg.SetFindingStatusWithNotify(r.Context(), id, *body.Status)
-		if err != nil {
-			writeErr(w, 500, err.Error())
-			return
-		}
-		if !found {
-			writeErr(w, 404, "finding not found")
-			return
-		}
-		if !notified && from != *body.Status {
-			log.Printf("[notify] status-change event not registered finding=%d %s→%s (status was updated)", id, from, *body.Status)
-		}
+	if body.Status != nil && !db.ValidFindingStatus(*body.Status) {
+		writeErr(w, 400, "bad status: "+*body.Status)
+		return
 	}
-	if body.ReportState != nil {
-		if !db.ValidFindingReportState(*body.ReportState) {
-			writeErr(w, 400, "bad report_state: "+*body.ReportState)
-			return
-		}
-		n, err := s.m.pg.SetFindingReportState(id, *body.ReportState)
-		if err != nil {
-			writeErr(w, 500, err.Error())
-			return
-		}
-		if n == 0 {
-			writeErr(w, 404, "finding not found")
-			return
-		}
+	if body.ReportState != nil && !db.ValidFindingReportState(*body.ReportState) {
+		writeErr(w, 400, "bad report_state: "+*body.ReportState)
+		return
 	}
-	if body.Severity != nil {
-		if !db.ValidSeverity(*body.Severity) {
-			writeErr(w, 400, "bad severity: "+*body.Severity)
-			return
-		}
-		n, err := s.m.pg.SetFindingSeverity(id, *body.Severity)
-		if err != nil {
-			writeErr(w, 500, err.Error())
-			return
-		}
-		if n == 0 {
-			writeErr(w, 404, "finding not found")
-			return
-		}
+	if body.Severity != nil && !db.ValidSeverity(*body.Severity) {
+		writeErr(w, 400, "bad severity: "+*body.Severity)
+		return
+	}
+	patch := db.FindingPatch{
+		Status:      body.Status,
+		ReportState: body.ReportState,
+		Severity:    body.Severity,
 	}
 	if body.Name != nil {
-		n, err := s.m.pg.SetFindingName(id, strings.TrimSpace(*body.Name))
-		if err != nil {
-			writeErr(w, 500, err.Error())
-			return
-		}
-		if n == 0 {
-			writeErr(w, 404, "finding not found")
-			return
-		}
+		trim := strings.TrimSpace(*body.Name)
+		patch.Name = &trim
 	}
 	if body.VulnClass != nil {
-		n, err := s.m.pg.SetFindingVulnClass(id, strings.TrimSpace(*body.VulnClass))
-		if err != nil {
-			writeErr(w, 500, err.Error())
-			return
-		}
-		if n == 0 {
-			writeErr(w, 404, "finding not found")
-			return
-		}
+		trim := strings.TrimSpace(*body.VulnClass)
+		patch.VulnClass = &trim
 	}
-	f, err := s.m.pg.GetFinding(id)
+	f, found, err := s.m.pg.PatchFinding(r.Context(), id, patch)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	if f == nil {
+	if !found || f == nil {
 		writeErr(w, 404, "finding not found")
 		return
 	}
@@ -2698,7 +2650,7 @@ func (s *Server) bulkPatchFindingStatus(w http.ResponseWriter, r *http.Request) 
 		IDs    []int64 `json:"ids"`
 		Status string  `json:"status"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decode(w, r, &body); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())
 		return
 	}
@@ -2753,7 +2705,7 @@ func (s *Server) bulkPatchFindingReportState(w http.ResponseWriter, r *http.Requ
 		IDs         []int64 `json:"ids"`
 		ReportState string  `json:"report_state"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decode(w, r, &body); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())
 		return
 	}
@@ -3644,7 +3596,7 @@ func (s *Server) deleteTrafficHosts(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Hosts []string `json:"hosts"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decode(w, r, &req); err != nil {
 		writeErr(w, 400, "invalid body")
 		return
 	}
@@ -3768,7 +3720,7 @@ func (s *Server) replayTraffic(w http.ResponseWriter, r *http.Request) {
 		BodyBase64 bool                   `json:"body_base64"`
 		ApplyRules bool                   `json:"apply_rules"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decode(w, r, &body); err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
 			writeErr(w, 413, "replay request too large")
@@ -3976,27 +3928,27 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		// Target noise profile: off|quiet|balanced|aggressive; null = unchanged. Applies to the next request, no agent rebuild.
 		NoiseProfile *string `json:"noise_profile"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decode(w, r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
-	}
-	// Validated before any other field is written, so a bad value changes nothing.
-	var noise egress.Profile
-	if req.NoiseProfile != nil {
-		var ok bool
-		if noise, ok = egress.ProfileByName(*req.NoiseProfile); !ok {
-			writeErr(w, 400, "noise_profile must be off, quiet, balanced or aggressive")
-			return
-		}
-		if err := s.m.pg.SetSetting(settingNoiseProfile, noise.Name); err != nil {
-			writeErr(w, 500, err.Error())
-			return
-		}
-		egress.SetProfile(noise)
 	}
 	// A masked placeholder echoed back keeps the stored secret, like null.
 	req.BraveKey, req.TavilyKey, req.KeenableKey = keepIfMasked(req.BraveKey), keepIfMasked(req.TavilyKey), keepIfMasked(req.KeenableKey)
 	req.WebSearchProxy, req.GlobalProxy = keepIfMasked(req.WebSearchProxy), keepIfMasked(req.GlobalProxy)
+	noise, noiseChosen, valErr := validatePutSettings(&putSettingsReq{
+		TrafficCapture: req.TrafficCapture, AgentTrafficBinding: req.AgentTrafficBinding, LLMRecord: req.LLMRecord,
+		WebSearchEnabled: req.WebSearchEnabled, WebSearchBackend: req.WebSearchBackend, BraveKey: req.BraveKey,
+		TavilyKey: req.TavilyKey, KeenableKey: req.KeenableKey, WebSearchProxy: req.WebSearchProxy, GlobalProxy: req.GlobalProxy,
+		PythonInterp: req.PythonInterp, Workers: req.Workers, ConcurrencyEnabled: req.ConcurrencyEnabled, ConcurrencyLimit: req.ConcurrencyLimit,
+		LLMPoolEnabled: req.LLMPoolEnabled, LLMPoolBindFallback: req.LLMPoolBindFallback, ConstraintsInjectPlanner: req.ConstraintsInjectPlanner,
+		ConstraintsInjectWorker: req.ConstraintsInjectWorker, NoaCompaction: req.NoaCompaction, NotifyEnabled: req.NotifyEnabled,
+		NotifyBaseURL: req.NotifyBaseURL, NotifyDigestMins: req.NotifyDigestMins, NotifySummaryMaxRunes: req.NotifySummaryMaxRunes,
+		NotifyAssetsMaxShown: req.NotifyAssetsMaxShown, NoiseProfile: req.NoiseProfile,
+	})
+	if valErr != nil {
+		writeErr(w, 400, valErr.Error())
+		return
+	}
 	if req.ConstraintsInjectPlanner != nil {
 		if err := s.m.pg.SetBool(settingConstraintsInjectPlanner, *req.ConstraintsInjectPlanner); err != nil {
 			writeErr(w, 500, err.Error())
@@ -4024,44 +3976,25 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if req.NotifyBaseURL != nil {
-		// Trim trailing slashes uniformly: backlinks are joined with fmt.Sprintf("%s/function/..."),
-		// and a trailing slash would produce double-slash paths like "//function/...".
 		base := trimTrailingSlash(strings.TrimSpace(*req.NotifyBaseURL))
-		if base != "" && !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
-			writeErr(w, 400, "backlink base URL must start with http:// or https://")
-			return
-		}
 		if err := s.m.pg.SetSetting(settingNotifyPublicBaseURL, base); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
 	}
 	if req.NotifyDigestMins != nil {
-		// 1-minute floor: any shorter period equals realtime push, in which case the channel should just be set to realtime mode.
-		if *req.NotifyDigestMins < 1 || *req.NotifyDigestMins > 24*60 {
-			writeErr(w, 400, "digest interval must be between 1 and 1440 minutes")
-			return
-		}
 		if err := s.m.pg.SetSetting(settingNotifyDigestMinutes, strconv.Itoa(*req.NotifyDigestMins)); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
 	}
 	if req.NotifySummaryMaxRunes != nil {
-		if *req.NotifySummaryMaxRunes < 0 || *req.NotifySummaryMaxRunes > notifySummaryMaxRunesCap {
-			writeErr(w, 400, fmt.Sprintf("summary limit must be between 0 and %d characters (0 = no truncation)", notifySummaryMaxRunesCap))
-			return
-		}
 		if err := s.m.pg.SetSetting(settingNotifySummaryMaxRunes, strconv.Itoa(*req.NotifySummaryMaxRunes)); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
 	}
 	if req.NotifyAssetsMaxShown != nil {
-		if *req.NotifyAssetsMaxShown < 0 || *req.NotifyAssetsMaxShown > notifyAssetsMaxShownCap {
-			writeErr(w, 400, fmt.Sprintf("asset limit must be between 0 and %d (0 = no truncation)", notifyAssetsMaxShownCap))
-			return
-		}
 		if err := s.m.pg.SetSetting(settingNotifyAssetsMaxShown, strconv.Itoa(*req.NotifyAssetsMaxShown)); err != nil {
 			writeErr(w, 500, err.Error())
 			return
@@ -4174,6 +4107,13 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	if noiseChosen {
+		if err := s.m.pg.SetSetting(settingNoiseProfile, noise.Name); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		egress.SetProfile(noise)
+	}
 	writeJSON(w, 200, s.settingsPayload())
 }
 
@@ -4191,7 +4131,7 @@ func (s *Server) testWebSearch(w http.ResponseWriter, r *http.Request) {
 		KeenableKey string `json:"keenable_search_api_key"`
 	}
 	// Empty body is fine — fall back entirely to the saved config below.
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+	if err := decode(w, r, &req); err != nil && err != io.EOF {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -4304,7 +4244,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		Attachments []chatAttachment `json:"attachments,omitempty"` // files uploaded via method 1 (paths relative to the task work dir)
 		Seg         *int             `json:"seg,omitempty"`         // target main-session segment; omitted = newest segment
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decode(w, r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -4551,21 +4491,4 @@ func cors(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
-}
-
-func writeJSON(w http.ResponseWriter, code int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(v)
-}
-
-func writeErr(w http.ResponseWriter, code int, msg string) {
-	writeJSON(w, code, map[string]any{"error": msg})
-}
-
-func atoiDefault(s string, d int) int {
-	if n, err := strconv.Atoi(s); err == nil {
-		return n
-	}
-	return d
 }

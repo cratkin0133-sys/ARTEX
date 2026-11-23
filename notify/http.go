@@ -9,11 +9,14 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/Autumn-27/artex/netguard"
 )
 
 // allowLocalTargets decides whether delivering messages to loopback / link-local
@@ -49,23 +52,16 @@ func allowLocalTargets() bool {
 // allowed for delivery by default".
 //
 // Only loopback, link-local (including the cloud metadata 169.254.169.254),
-// unspecified, and multicast are rejected. RFC1918 private networks are **not**
-// rejected: self-hosted Mattermost / SMTP relays on an intranet are very common
-// legitimate uses, and blocking them too would make the feature flat-out
-// unusable in real environments. This trade-off is deliberate — the protection
-// must stop the truly sensitive targets without killing normal deployments along
-// the way.
+// unspecified, multicast and the other instance-metadata addresses are
+// rejected, also behind their IPv4-mapped, NAT64 and 6to4 forms. RFC1918
+// private networks are **not** rejected: self-hosted Mattermost / SMTP relays
+// on an intranet are very common legitimate uses, and blocking them too would
+// make the feature flat-out unusable in real environments. This trade-off is
+// deliberate — the protection must stop the truly sensitive targets without
+// killing normal deployments along the way.
 func isBlockedDialIP(ip net.IP) bool {
-	if ip == nil {
-		return true
-	}
-	// IPv4-mapped IPv6 (::ffff:127.0.0.1) must be converted back to IPv4 before
-	// the check, otherwise it bypasses it.
-	if v4 := ip.To4(); v4 != nil {
-		ip = v4
-	}
-	return ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
-		ip.IsInterfaceLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast()
+	addr, ok := netip.AddrFromSlice(ip)
+	return !ok || netguard.NotifyDialBlocked(addr, false)
 }
 
 // blockInternalDial is the Control hook of the http.Transport dialer, checking
@@ -78,19 +74,16 @@ func isBlockedDialIP(ip net.IP) bool {
 // (cross-host redirects are already refused, but a same-host redirect can still
 // point the path elsewhere).
 func blockInternalDial(_, address string, _ syscall.RawConn) error {
-	if allowLocalTargets() {
-		return nil
-	}
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
 		return err
 	}
-	ip := net.ParseIP(host)
-	if ip == nil {
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
 		return fmt.Errorf("cannot parse target address %q", host)
 	}
-	if isBlockedDialIP(ip) {
-		return fmt.Errorf("refusing to deliver to loopback/link-local address %s (if you really need to deliver to a local service, set %s=1)", ip, AllowLocalTargetsEnv)
+	if netguard.NotifyDialBlocked(addr, allowLocalTargets()) {
+		return fmt.Errorf("refusing to deliver to loopback/link-local address %s (if you really need to deliver to a local service, set %s=1)", addr, AllowLocalTargetsEnv)
 	}
 	return nil
 }

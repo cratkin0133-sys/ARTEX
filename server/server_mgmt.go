@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"mime"
 	"net"
 	"net/http"
 	"net/netip"
@@ -32,6 +31,7 @@ import (
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
+	"github.com/Autumn-27/artex/netguard"
 	"github.com/Autumn-27/artex/notify"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/skill"
@@ -79,93 +79,6 @@ func (s *Server) pg(w http.ResponseWriter) *db.DB {
 		return nil
 	}
 	return s.m.pg
-}
-
-func pathInt(r *http.Request, name string) (int64, bool) {
-	n, err := strconv.ParseInt(r.PathValue(name), 10, 64)
-	return n, err == nil
-}
-
-// decodeMaxBytes is the default JSON body cap. Multipart uploads are not capped
-// here; those handlers set their own limit. A smaller MaxBytesReader installed
-// by a handler still wins, because it sits inside this one.
-const decodeMaxBytes = 32 << 20
-
-// limitedBody records a MaxBytesError so a later 400 can be answered as 413.
-type limitedBody struct {
-	io.ReadCloser
-	tooLarge bool
-}
-
-func (b *limitedBody) Read(p []byte) (int, error) {
-	n, err := b.ReadCloser.Read(p)
-	var tooLarge *http.MaxBytesError
-	if errors.As(err, &tooLarge) {
-		b.tooLarge = true
-	}
-	return n, err
-}
-
-type bodyLimitWriter struct {
-	http.ResponseWriter
-	tooLarge func() bool
-}
-
-func (b *bodyLimitWriter) WriteHeader(code int) {
-	if code == http.StatusBadRequest && b.tooLarge != nil && b.tooLarge() {
-		code = http.StatusRequestEntityTooLarge
-	}
-	b.ResponseWriter.WriteHeader(code)
-}
-
-func (b *bodyLimitWriter) Flush() {
-	if f, ok := b.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
-	}
-}
-
-func (b *bodyLimitWriter) Unwrap() http.ResponseWriter { return b.ResponseWriter }
-
-// limitRequestBody caps a non-multipart body at decodeMaxBytes and passes the
-// real ResponseWriter into MaxBytesReader. A handler that then answers 400 for
-// that read is rewritten to 413.
-func limitRequestBody(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Body == nil || r.Body == http.NoBody || isMultipart(r) {
-			next.ServeHTTP(w, r)
-			return
-		}
-		body := &limitedBody{ReadCloser: http.MaxBytesReader(w, r.Body, decodeMaxBytes)}
-		r.Body = body
-		next.ServeHTTP(&bodyLimitWriter{ResponseWriter: w, tooLarge: func() bool { return body.tooLarge }}, r)
-	})
-}
-
-func isMultipart(r *http.Request) bool {
-	media, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
-	if err != nil {
-		return false
-	}
-	return strings.HasPrefix(media, "multipart/")
-}
-
-func decode(w http.ResponseWriter, r *http.Request, v any) error {
-	if r.Body != nil {
-		if _, already := r.Body.(*limitedBody); !already {
-			r.Body = &limitedBody{ReadCloser: http.MaxBytesReader(w, r.Body, decodeMaxBytes)}
-		}
-	}
-	err := json.NewDecoder(r.Body).Decode(v)
-	var tooLarge *http.MaxBytesError
-	if errors.As(err, &tooLarge) {
-		if lb, ok := r.Body.(*limitedBody); ok {
-			lb.tooLarge = true
-		}
-		// Return the original error: a caller that maps 413 itself keeps working,
-		// and the middleware still rewrites a 400 for callers that do not.
-		return tooLarge
-	}
-	return err
 }
 
 // ---------- tasks (delete) ----------
@@ -456,78 +369,50 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 		TriggerMergeMode   *string `json:"trigger_merge_mode"`
 		TriggerMaxParallel *int    `json:"trigger_max_parallel"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decode(w, r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
 	profileChanged := false
-	if req.LLMProfileID != nil { // key present (number or null)
+	patch := db.AgentConfigPatch{
+		MaxTurns:         req.MaxTurns,
+		RunSeconds:       req.RunSeconds,
+		WebSearch:        req.WebSearch,
+		InteractiveShell: req.InteractiveShell,
+		TriggerRunMode:   req.TriggerRunMode,
+		TriggerMergeMode: req.TriggerMergeMode,
+		TriggerMaxPar:    req.TriggerMaxParallel,
+	}
+	if req.LLMProfileID != nil {
 		var id *int64
 		if err := json.Unmarshal(req.LLMProfileID, &id); err != nil {
 			writeErr(w, 400, "invalid llm_profile_id format")
 			return
 		}
-		if id != nil { // bind: validate the target profile
+		if id != nil {
 			if _, ok := s.loadProfileConfig(*id); !ok {
 				writeErr(w, 400, "the specified LLM profile does not exist or is invalid")
 				return
 			}
-		}
-		if err := pg.SetAgentLLMProfile(a.Key, id); err != nil {
-			writeErr(w, 500, err.Error())
-			return
+			patch.LLMProfileID = id
+		} else {
+			patch.ClearLLMProfile = true
 		}
 		profileChanged = true
 	}
-	if req.MaxTurns != nil {
-		mt := *req.MaxTurns
-		if mt < 0 {
-			mt = 0
-		}
-		if err := pg.SetAgentMaxTurns(a.Key, mt); err != nil {
-			writeErr(w, 500, err.Error())
-			return
-		}
+	if req.MaxTurns == nil && req.RunSeconds == nil && req.WebSearch == nil && req.InteractiveShell == nil &&
+		req.LLMProfileID == nil && req.TriggerRunMode == nil && req.TriggerMergeMode == nil && req.TriggerMaxParallel == nil {
+		writeErr(w, 400, "nothing to update")
+		return
 	}
-	if req.RunSeconds != nil {
-		rs := *req.RunSeconds
-		if rs < 0 {
-			rs = 0
-		}
-		if err := pg.SetAgentRunSeconds(a.Key, rs); err != nil {
-			writeErr(w, 500, err.Error())
-			return
-		}
+	ok, err := pg.PatchAgentConfig(r.Context(), a.Key, patch)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
 	}
-	if req.WebSearch != nil {
-		if err := pg.SetAgentWebSearch(a.Key, *req.WebSearch); err != nil {
-			writeErr(w, 500, err.Error())
-			return
-		}
-	}
-	if req.InteractiveShell != nil {
-		if err := pg.SetAgentInteractiveShell(a.Key, *req.InteractiveShell); err != nil {
-			writeErr(w, 500, err.Error())
-			return
-		}
-	}
-	// P3 trigger policy: the three are written as a group (SetAgentTriggerBehavior
-	// writes all three columns at once), with missing fields backfilled from current stored values so passing only one does not reset the other two to defaults.
-	if req.TriggerRunMode != nil || req.TriggerMergeMode != nil || req.TriggerMaxParallel != nil {
-		runMode, mergeMode, maxPar := a.TriggerRunMode, a.TriggerMergeMode, a.TriggerMaxParallel
-		if req.TriggerRunMode != nil {
-			runMode = *req.TriggerRunMode
-		}
-		if req.TriggerMergeMode != nil {
-			mergeMode = *req.TriggerMergeMode
-		}
-		if req.TriggerMaxParallel != nil {
-			maxPar = *req.TriggerMaxParallel
-		}
-		if err := pg.SetAgentTriggerBehavior(a.Key, runMode, mergeMode, maxPar); err != nil {
-			writeErr(w, 500, err.Error())
-			return
-		}
+	if !ok {
+		writeErr(w, 404, "agent not found")
+		return
 	}
 	// an agent's LLM binding change also invalidates pinned-task / per-profile caches
 	// so their next round re-resolves each agent's bound model.
@@ -2389,77 +2274,6 @@ func sameRedirectHost(a, b *url.URL) bool {
 	return ha != "" && ha == hb
 }
 
-// Ranges that are not public Internet addresses and that
-// intercept.IsNonPublicAddr does not cover. The shared ones are in use on
-// private networks (overlay networks, fake-IP resolvers), so an allow-listed
-// endpoint may sit there; the reserved ones are never a model endpoint.
-var (
-	modelSharedPrefixes = []netip.Prefix{
-		netip.MustParsePrefix("100.64.0.0/10"), // carrier-grade NAT (RFC 6598)
-		netip.MustParsePrefix("198.18.0.0/15"), // benchmarking (RFC 2544)
-	}
-	modelReservedPrefixes = []netip.Prefix{
-		netip.MustParsePrefix("192.0.0.0/24"), // IETF protocol assignments (RFC 6890)
-		netip.MustParsePrefix("240.0.0.0/4"),  // reserved, and the limited broadcast address
-	}
-	// IPv6 prefixes whose addresses reach the IPv4 host they embed. A DNS64
-	// resolver answers with NAT64 addresses for every IPv4-only name, so the
-	// prefixes are not blocked as a whole: the embedded address is judged.
-	modelNAT64Prefix = netip.MustParsePrefix("64:ff9b::/96") // the low 32 bits name an IPv4 host
-	model6to4Prefix  = netip.MustParsePrefix("2002::/16")    // bits 16 to 47 name an IPv4 host
-)
-
-// modelEmbeddedIPv4 returns the IPv4 address a NAT64 or 6to4 address embeds.
-func modelEmbeddedIPv4(addr netip.Addr) (netip.Addr, bool) {
-	b := addr.As16()
-	switch {
-	case modelNAT64Prefix.Contains(addr):
-		return netip.AddrFrom4([4]byte(b[12:16])), true
-	case model6to4Prefix.Contains(addr):
-		return netip.AddrFrom4([4]byte(b[2:6])), true
-	}
-	return netip.Addr{}, false
-}
-
-func prefixesContain(prefixes []netip.Prefix, addr netip.Addr) bool {
-	for _, p := range prefixes {
-		if p.Contains(addr) {
-			return true
-		}
-	}
-	return false
-}
-
-func (s *Server) isBlockedModelAddr(addr netip.Addr, allowPrivate bool) bool {
-	if !addr.IsValid() {
-		return true
-	}
-	addr = addr.Unmap().WithZone("")
-	if v4, ok := modelEmbeddedIPv4(addr); ok {
-		addr = v4
-	}
-	if s != nil && s.allowLoopbackModels && addr.IsLoopback() {
-		return false
-	}
-	shared := prefixesContain(modelSharedPrefixes, addr)
-	if !intercept.IsNonPublicAddr(addr) && !shared && !prefixesContain(modelReservedPrefixes, addr) {
-		return false
-	}
-	if allowPrivate {
-		// Allow-listed self-hosted endpoints may resolve to loopback, RFC1918 /
-		// unique-local private addresses, or the shared ranges above, but never
-		// link-local, unspecified, multicast, reserved, or instance-metadata
-		// addresses (such as 169.254.169.254, 100.100.100.200 or fd00:ec2::254).
-		if addr.IsLoopback() {
-			return false
-		}
-		if (addr.IsPrivate() || shared) && intercept.ValidateExemptionHost(addr.String()) == nil {
-			return false
-		}
-	}
-	return true
-}
-
 func (s *Server) lookupModelIPs(ctx context.Context, host string) ([]netip.Addr, error) {
 	if s != nil && s.modelLookupIP != nil {
 		return s.modelLookupIP(ctx, host)
@@ -2478,6 +2292,13 @@ func newModelURLGuard(s *Server) *modelURLGuard {
 	return &modelURLGuard{
 		s:                s,
 		privateEndpoints: parsePrivateModelEndpoints(os.Getenv(LLMPrivateEndpointsEnv)),
+	}
+}
+
+func (g *modelURLGuard) policy(allowPrivate bool) netguard.ModelPolicy {
+	return netguard.ModelPolicy{
+		AllowPrivateEndpoint: allowPrivate,
+		AllowLoopbackModels:  g.s != nil && g.s.allowLoopbackModels,
 	}
 }
 
@@ -2511,8 +2332,7 @@ func (g *modelURLGuard) blockDial(_, address string, _ syscall.RawConn) error {
 	if err != nil {
 		return &modelURLRefusalError{msg: "target address is not allowed"}
 	}
-	allowPrivate := g.isAllowedDialAddr(addr, port)
-	if g.s.isBlockedModelAddr(addr, allowPrivate) {
+	if netguard.ModelDialBlocked(addr, g.policy(g.isAllowedDialAddr(addr, port))) {
 		return &modelURLRefusalError{msg: "target address is not allowed"}
 	}
 	return nil
@@ -2544,10 +2364,11 @@ func (g *modelURLGuard) validateURL(ctx context.Context, rawURL, role string) (*
 	}
 	hostPort := net.JoinHostPort(normHost, strconv.Itoa(port))
 	allowPrivate := g.privateEndpoints[hostPort]
+	pol := g.policy(allowPrivate)
 
 	if kind == intercept.TargetIP {
 		addr, err := netip.ParseAddr(normHost)
-		if err != nil || g.s.isBlockedModelAddr(addr, allowPrivate) {
+		if err != nil || netguard.ModelDialBlocked(addr, pol) {
 			return nil, &modelURLRefusalError{msg: fmt.Sprintf("%s URL host is not allowed", role)}
 		}
 		if allowPrivate {
@@ -2555,7 +2376,7 @@ func (g *modelURLGuard) validateURL(ctx context.Context, rawURL, role string) (*
 		}
 		return u, nil
 	}
-	if !allowPrivate && !(g.s != nil && g.s.allowLoopbackModels) && (normHost == "localhost" || strings.HasSuffix(normHost, ".localhost")) {
+	if !allowPrivate && !pol.AllowLoopbackModels && (normHost == "localhost" || strings.HasSuffix(normHost, ".localhost")) {
 		return nil, &modelURLRefusalError{msg: fmt.Sprintf("%s URL host is not allowed", role)}
 	}
 	addrs, err := g.s.lookupModelIPs(ctx, normHost)
@@ -2563,7 +2384,7 @@ func (g *modelURLGuard) validateURL(ctx context.Context, rawURL, role string) (*
 		return nil, &modelURLRefusalError{msg: fmt.Sprintf("failed to resolve %s host", role)}
 	}
 	for _, addr := range addrs {
-		if g.s.isBlockedModelAddr(addr, allowPrivate) {
+		if netguard.ModelDialBlocked(addr, pol) {
 			return nil, &modelURLRefusalError{msg: fmt.Sprintf("%s URL host is not allowed", role)}
 		}
 	}

@@ -1,7 +1,6 @@
 package server
 
 import (
-	"encoding/json"
 	"net/http"
 	"strconv"
 
@@ -64,7 +63,7 @@ func (s *Server) addTaskCredential(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req taskCredentialReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decode(w, r, &req); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())
 		return
 	}

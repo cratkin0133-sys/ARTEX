@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/Autumn-27/artex/netguard"
 )
 
 // Ranges that are not public Internet addresses but are neither RFC 1918 nor
@@ -30,7 +32,7 @@ func TestLLMModelsRefusesReservedRanges(t *testing.T) {
 	for name, addrs := range reservedModelAddrs {
 		for _, a := range addrs {
 			addr := netip.MustParseAddr(a)
-			if !s.isBlockedModelAddr(addr, false) {
+			if !netguard.ModelDialBlocked(addr, netguard.ModelPolicy{}) {
 				t.Errorf("%s: %s is allowed, want it blocked", name, a)
 			}
 			// As a literal host: refused before any request, without the address.
@@ -58,7 +60,7 @@ func TestLLMModelsRefusesReservedRanges(t *testing.T) {
 	}
 	// The addresses next to each range stay public.
 	for _, a := range []string{"100.63.255.255", "100.128.0.1", "198.17.255.255", "198.20.0.1", "192.0.1.1", "93.184.216.34", "64:ff9a::1", "2001:4860:4860::8888", "2003::1"} {
-		if s.isBlockedModelAddr(netip.MustParseAddr(a), false) {
+		if netguard.ModelDialBlocked(netip.MustParseAddr(a), netguard.ModelPolicy{}) {
 			t.Errorf("%s is blocked, want it allowed", a)
 		}
 	}
@@ -84,7 +86,6 @@ func TestLLMModelsDialGuardRefusesReservedRanges(t *testing.T) {
 // (a fake-IP resolver), as it may in RFC 1918 space. The other reserved ranges
 // and the metadata address inside 100.64.0.0/10 are never allowed.
 func TestLLMModelsPrivateEndpointListCoversSharedRanges(t *testing.T) {
-	s := &Server{}
 	for a, wantBlocked := range map[string]bool{
 		"100.64.0.1":         false,
 		"198.18.0.1":         false,
@@ -96,7 +97,7 @@ func TestLLMModelsPrivateEndpointListCoversSharedRanges(t *testing.T) {
 		"2002:a9fe:a9fe::1":  true,
 		"169.254.169.254":    true,
 	} {
-		if got := s.isBlockedModelAddr(netip.MustParseAddr(a), true); got != wantBlocked {
+		if got := netguard.ModelDialBlocked(netip.MustParseAddr(a), netguard.ModelPolicy{AllowPrivateEndpoint: true}); got != wantBlocked {
 			t.Errorf("allow-listed %s: blocked=%v, want %v", a, got, wantBlocked)
 		}
 	}
