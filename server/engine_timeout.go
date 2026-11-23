@@ -27,22 +27,19 @@ const (
 // ---------- settling state ----------
 
 func (e *Engine) isSettling(taskID string) bool {
-	v, _ := e.settling.Load(taskID)
-	b, _ := v.(bool)
-	return b
+	s, ok := e.loadSlot(taskID)
+	return ok && s.isSettling()
 }
 
 // markSettling flips settling on; returns true only for the first caller.
 func (e *Engine) markSettling(taskID string) bool {
-	_, loaded := e.settling.LoadOrStore(taskID, true)
-	return !loaded
+	return e.slot(taskID).tryMarkSettling()
 }
 
 // ---------- in-flight count (worker.Execute + planner.Plan), used for drain ----------
 
 func (e *Engine) inflightCounter(taskID string) *int64 {
-	v, _ := e.inflight.LoadOrStore(taskID, new(int64))
-	return v.(*int64)
+	return e.slot(taskID).inflightPtr()
 }
 
 // beginTaskOperation atomically registers a task-owned operation unless deletion
@@ -73,8 +70,8 @@ func (e *Engine) inflightCount(taskID string) int64 {
 // detached chat runs that are not members of a task WaitGroup.
 func (e *Engine) inflightTotal() int64 {
 	var n int64
-	e.inflight.Range(func(_, v any) bool {
-		n += atomic.LoadInt64(v.(*int64))
+	e.slots.Range(func(_, v any) bool {
+		n += v.(*taskSlot).inflightValue()
 		return true
 	})
 	return n
@@ -86,12 +83,12 @@ func (e *Engine) inflightTotal() int64 {
 // map (stamped this session); falls back to the DB-loaded value (restart), seeding
 // the map. 0 = no timeout / not yet stamped.
 func (e *Engine) taskDeadline(t *Task) int64 {
-	if v, ok := e.deadline.Load(t.ID); ok {
-		return v.(int64)
+	if dl, ok := e.slot(t.ID).getDeadline(); ok {
+		return dl
 	}
 	deadlineAt := t.lifecycleSnapshot().DeadlineAt
 	if deadlineAt > 0 {
-		e.deadline.Store(t.ID, deadlineAt)
+		e.slot(t.ID).setDeadline(deadlineAt)
 		return deadlineAt
 	}
 	return 0
@@ -104,9 +101,7 @@ func (e *Engine) taskDeadline(t *Task) int64 {
 // produced the timeout has already completed (or is in its final return path).
 func (e *Engine) resetTimeoutRevival(taskID string) {
 	e.resetSettledRun(taskID)
-	e.deadline.Delete(taskID)
-	e.stamped.Delete(taskID)
-	e.coordStarted.Delete(taskID)
+	e.slot(taskID).resetTimeoutFields()
 }
 
 // resetSettledRun clears the settle state of a finished run (settling and the
@@ -116,8 +111,9 @@ func (e *Engine) resetTimeoutRevival(taskID string) {
 // already did in the same UPDATE as the revive; this is idempotent and never
 // touches a task that is terminal again).
 func (e *Engine) resetSettledRun(taskID string) {
-	e.settling.Delete(taskID)
-	e.budgets.Delete(taskID)
+	s := e.slot(taskID)
+	s.clearSettling()
+	s.clearBudget()
 	if e.m != nil && e.m.pg != nil {
 		if n, err := strconv.ParseInt(taskID, 10, 64); err == nil {
 			if err := e.m.pg.ClearRunEndReason(n); err != nil {
@@ -133,17 +129,17 @@ func (e *Engine) stampFirstRun(t *Task) {
 	if t.TimeoutSeconds <= 0 {
 		return
 	}
-	if _, loaded := e.stamped.LoadOrStore(t.ID, true); loaded {
+	if e.slot(t.ID).tryMarkStamped() {
 		return
 	}
 	dl, err := e.m.StampTaskFirstRun(t.ID)
 	if err != nil {
 		log.Printf("[deadline] task %s failed to stamp first_run: %v", t.ID, err)
-		e.stamped.Delete(t.ID) // allow the next attempt to retry
+		e.slot(t.ID).clearStamped() // allow the next attempt to retry
 		return
 	}
 	if dl > 0 {
-		e.deadline.Store(t.ID, dl)
+		e.slot(t.ID).setDeadline(dl)
 		log.Printf("[deadline] task %s first run, deadline at %s", t.ID, time.Unix(dl, 0).Format("2006-01-02 15:04:05"))
 	}
 }
@@ -173,14 +169,14 @@ func (e *Engine) startDeadlineCoordinator(ctx context.Context, t *Task) {
 		e.deleteMu.RUnlock()
 		return
 	}
-	if _, loaded := e.coordStarted.LoadOrStore(t.ID, true); loaded {
+	if e.slot(t.ID).tryMarkCoordStarted() {
 		e.deleteMu.RUnlock()
 		return
 	}
 	rt := e.registerTaskRoutines(ctx, t.ID, 1)
 	e.deleteMu.RUnlock()
 	if rt == nil {
-		e.coordStarted.Delete(t.ID)
+		e.slot(t.ID).clearCoordStarted()
 		return
 	}
 	runTaskRoutine(rt, func(loopCtx context.Context) { e.deadlineCoordinator(loopCtx, t) })

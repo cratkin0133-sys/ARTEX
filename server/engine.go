@@ -48,8 +48,7 @@ func dropReason(err error) string {
 // counter is an atomic behind sync.Map. The count in the log shows loss scale at a
 // glance instead of forcing a grep-and-count.
 func (e *Engine) bumpDrop(taskID string) int64 {
-	v, _ := e.dropCnt.LoadOrStore(taskID, new(int64))
-	return atomic.AddInt64(v.(*int64), 1)
+	return e.slot(taskID).bumpDrop()
 }
 
 // preview collapses newlines and trims s to a short rune-safe snippet for one-line
@@ -98,16 +97,8 @@ type Engine struct {
 
 	bc *Broadcaster // live activity pub/sub (SSE)
 
-	started  sync.Map // taskID -> bool, so Run is idempotent per task
-	lastAct  sync.Map // taskID -> int64 unix, last planner/worker activity (heartbeat)
-	llmCalls sync.Map // taskID -> *int64, actual planner/worker/main-agent LLM calls
-	// quiet-mode (#79): open-goal fingerprint recorded at the end of the last
-	// completed planning round, per task. Edge-triggered rounds are skipped
-	// while it is unchanged and work is still in flight.
-	goalFP   sync.Map // taskID -> string (sorted open-goal ids joined)
-	paused   sync.Map // taskID -> bool, user-paused (planner + workers idle but loops alive)
-	deleting sync.Map // taskID -> bool, delete barrier (no new task-owned writes)
-	dropCnt  sync.Map // taskID -> *int64, running count of dropped (unpersistable) activity records
+	// Per-task lifecycle and runtime counters (see taskSlot in engine_task_slot.go).
+	slots sync.Map // taskID -> *taskSlot
 
 	// deleteMu makes installing the delete barrier atomic with registering a new
 	// task operation. Once BeginDelete returns, every admitted writer is reflected
@@ -141,15 +132,7 @@ type Engine struct {
 	steerMu  sync.Mutex
 	steerBox map[int64][]string
 
-	plannerRound sync.Map // taskID -> int, planner round counter (for UI round separators)
-
-	// Task-level timeout (see docs/task-timeout-and-settle-design.md):
-	settling     sync.Map // taskID -> bool, the task has entered the settlement sequence (stop dispatching/claiming intents)
-	deadline     sync.Map // taskID -> int64 unix, absolute deadline (stamped on first run; 0/missing = no limit)
-	stamped      sync.Map // taskID -> bool, whether first_run_at has been stamped (once per process)
-	inflight     sync.Map // taskID -> *int64, count of in-flight planner.Plan + worker.Execute (for drain)
-	coordStarted sync.Map // taskID -> bool, whether the deadline coordinator has started (deduplicated across Run/reload)
-	budgets      sync.Map // taskID -> *agent.BudgetLedger, run budget meter (nil = no budget configured; see engine_budget.go)
+	// Task-level timeout fields live on taskSlot (see docs/task-timeout-and-settle-design.md).
 
 	// resolve returns a task's dedicated planner/worker (wired by the server as the
 	// authoritative task-router). nil,nil means this task is deliberately unavailable
@@ -175,16 +158,13 @@ type workExecution struct {
 
 // nextPlannerRound returns the next planner round number for a task (1-based).
 func (e *Engine) nextPlannerRound(taskID string) int {
-	v, _ := e.plannerRound.LoadOrStore(taskID, 0)
-	n := v.(int) + 1
-	e.plannerRound.Store(taskID, n)
-	return n
+	return e.slot(taskID).nextPlannerRound()
 }
 
 // Pause stops a task: marks it paused AND cancels any in-flight planner/worker run
 // for it (a long worker.Execute would otherwise keep going until it finishes).
 func (e *Engine) Pause(taskID string, cause error) {
-	e.paused.Store(taskID, true)
+	e.slot(taskID).setPaused(true)
 	e.cancelExec(taskID, cause)
 }
 
@@ -194,11 +174,11 @@ func (e *Engine) Pause(taskID string, cause error) {
 // paused/queued if cleanup fails.
 func (e *Engine) BeginDelete(taskID string) bool {
 	e.deleteMu.Lock()
-	if _, loaded := e.deleting.LoadOrStore(taskID, true); loaded {
+	if !e.slot(taskID).tryMarkDeleting() {
 		e.deleteMu.Unlock()
 		return false
 	}
-	e.paused.Store(taskID, true)
+	e.slot(taskID).setPaused(true)
 	e.deleteMu.Unlock()
 	e.cancelExec(taskID, agent.AbortTaskDeleted)
 	return true
@@ -210,9 +190,9 @@ func (e *Engine) AbortDelete(taskID string, keepPaused bool) {
 		e.deleteMu.Unlock()
 		return
 	}
-	e.deleting.Delete(taskID)
+	e.slot(taskID).setDeleting(false)
 	if !keepPaused {
-		e.paused.Delete(taskID)
+		e.slot(taskID).setPaused(false)
 	}
 	e.deleteMu.Unlock()
 	if !keepPaused && e.m != nil {
@@ -223,8 +203,8 @@ func (e *Engine) AbortDelete(taskID string, keepPaused bool) {
 }
 
 func (e *Engine) IsDeleting(taskID string) bool {
-	_, ok := e.deleting.Load(taskID)
-	return ok
+	s, ok := e.loadSlot(taskID)
+	return ok && s.isDeleting()
 }
 
 // registerTaskRoutines reserves count goroutines in the task runtime. Callers
@@ -312,7 +292,7 @@ func waitGroup(ctx context.Context, wg *sync.WaitGroup) error {
 // until cleanup finishes, so no new task operation can race the teardown.
 func (e *Engine) StopTask(taskID string) {
 	e.deleteMu.Lock()
-	e.deleting.Store(taskID, true)
+	e.slot(taskID).setDeleting(true)
 	e.deleteMu.Unlock()
 
 	e.cancelExec(taskID, agent.AbortTaskDeleted)
@@ -340,21 +320,7 @@ func (e *Engine) StopTask(taskID string) {
 	}
 	e.runtimeMu.Unlock()
 
-	e.started.Delete(taskID)
-	e.lastAct.Delete(taskID)
-	e.llmCalls.Delete(taskID)
-	e.paused.Delete(taskID)
-	e.dropCnt.Delete(taskID)
-	e.plannerRound.Delete(taskID)
-	e.settling.Delete(taskID)
-	e.deadline.Delete(taskID)
-	e.stamped.Delete(taskID)
-	e.inflight.Delete(taskID)
-	e.coordStarted.Delete(taskID)
-	e.budgets.Delete(taskID)
-	e.deleteMu.Lock()
-	e.deleting.Delete(taskID)
-	e.deleteMu.Unlock()
+	e.dropTaskSlot(taskID)
 }
 
 // cancelExec cancels a task's current per-task exec context (any in-flight
@@ -382,7 +348,7 @@ func (e *Engine) Resume(t *Task) {
 	if e.IsDeleting(t.ID) {
 		return
 	}
-	e.paused.Delete(t.ID)
+	e.slot(t.ID).setPaused(false)
 	t.Notify()
 }
 
@@ -408,50 +374,46 @@ func (e *Engine) execContextFor(parent context.Context, taskID string) context.C
 
 // IsPaused reports whether a task is user-paused.
 func (e *Engine) IsPaused(taskID string) bool {
-	v, ok := e.paused.Load(taskID)
-	return ok && v.(bool)
+	s, ok := e.loadSlot(taskID)
+	return ok && s.isPaused()
 }
 
 // Started reports whether the engine loops are running for a task.
 func (e *Engine) Started(taskID string) bool {
-	_, ok := e.started.Load(taskID)
-	return ok
+	s, ok := e.loadSlot(taskID)
+	return ok && s.isStarted()
 }
 
 // LastActivity returns the unix time of the last planner/worker activity for a
 // task (0 if none yet).
 func (e *Engine) LastActivity(taskID string) int64 {
-	if v, ok := e.lastAct.Load(taskID); ok {
-		return v.(int64)
+	s, ok := e.loadSlot(taskID)
+	if !ok {
+		return 0
 	}
-	return 0
+	return s.lastActivity()
 }
 
 // BeginLLMCall/EndLLMCall track actual provider calls separately from the
 // scheduler's task-operation counter. A task can have live loops while all of
 // them are waiting for a trigger; that state must remain idle in the UI.
 func (e *Engine) BeginLLMCall(taskID string) {
-	v, _ := e.llmCalls.LoadOrStore(taskID, new(int64))
-	atomic.AddInt64(v.(*int64), 1)
+	e.slot(taskID).beginLLMCall()
 }
 
 func (e *Engine) EndLLMCall(taskID string) {
-	if v, ok := e.llmCalls.Load(taskID); ok {
-		p := v.(*int64)
-		if atomic.AddInt64(p, -1) <= 0 {
-			atomic.StoreInt64(p, 0)
-		}
-	}
+	e.slot(taskID).endLLMCall()
 }
 
 func (e *Engine) ActiveLLMCalls(taskID string) int64 {
-	if v, ok := e.llmCalls.Load(taskID); ok {
-		return atomic.LoadInt64(v.(*int64))
+	s, ok := e.loadSlot(taskID)
+	if !ok {
+		return 0
 	}
-	return 0
+	return s.activeLLMCalls()
 }
 
-func (e *Engine) touch(taskID string) { e.lastAct.Store(taskID, time.Now().Unix()) }
+func (e *Engine) touch(taskID string) { e.slot(taskID).touch() }
 
 func NewEngine(m *Manager) *Engine {
 	return &Engine{m: m, debounce: 800 * time.Millisecond, bc: NewBroadcaster(),
@@ -839,7 +801,7 @@ func (e *Engine) Run(ctx context.Context, t *Task) {
 		e.deleteMu.RUnlock()
 		return
 	}
-	if _, loaded := e.started.LoadOrStore(t.ID, true); loaded {
+	if e.slot(t.ID).tryMarkStarted() {
 		e.deleteMu.RUnlock()
 		t.Notify() // already running — just nudge a planning round
 		return
@@ -847,7 +809,7 @@ func (e *Engine) Run(ctx context.Context, t *Task) {
 	rt := e.registerTaskRoutines(ctx, t.ID, 2+workers)
 	e.deleteMu.RUnlock()
 	if rt == nil {
-		e.started.Delete(t.ID)
+		e.slot(t.ID).clearStarted()
 		return
 	}
 	e.touch(t.ID)
@@ -898,7 +860,7 @@ func (e *Engine) quietSkipEdge(t *Task) bool {
 	if err != nil {
 		return false
 	}
-	if last, ok := e.goalFP.Load(t.ID); !ok || last != fp {
+	if last, ok := e.slot(t.ID).openGoalFP(); !ok || last != fp {
 		return false
 	}
 	active, err := t.Store.HasActiveIntent()
@@ -1037,7 +999,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		// goals opened or closed by this round change it, so a later edge can
 		// tell "nothing changed" apart from "the plan input changed".
 		if fp, err := t.Store.OpenGoalFingerprint(); err == nil {
-			e.goalFP.Store(t.ID, fp)
+			e.slot(t.ID).storeGoalFP(fp)
 		}
 		if e.budgetBlocksClaim(t.ID) {
 			t.Notify() // this round crossed the budget: settle on the next round, not at the next heartbeat

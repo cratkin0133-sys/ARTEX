@@ -14,14 +14,14 @@ import (
 // budgetFor returns the task's budget ledger, created on first use from the env;
 // nil when no budget is configured (passthrough).
 func (e *Engine) budgetFor(taskID string) *agent.BudgetLedger {
-	if v, ok := e.budgets.Load(taskID); ok {
-		return v.(*agent.BudgetLedger)
+	s := e.slot(taskID)
+	if l := s.budgetLedger(); l != nil {
+		return l
 	}
 	created := agent.NewBudgetLedger(agent.BudgetsFromEnv())
 	e.seedBudget(taskID, created)
-	v, loaded := e.budgets.LoadOrStore(taskID, created)
-	if loaded {
-		return v.(*agent.BudgetLedger)
+	if l, loaded := s.setBudgetLedger(created); loaded {
+		return l
 	}
 	return created
 }

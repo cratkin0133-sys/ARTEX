@@ -47,7 +47,7 @@ func TestPlannerQuietSkipEdge(t *testing.T) {
 	if fp == "" {
 		t.Fatal("fingerprint must not be empty with an open goal")
 	}
-	e.goalFP.Store(tt.ID, fp)
+	e.slot(tt.ID).storeGoalFP(fp)
 	if !e.quietSkipEdge(tt) {
 		t.Fatal("unchanged goals + active intent must skip the edge round")
 	}
@@ -68,7 +68,7 @@ func TestPlannerQuietSkipEdge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.goalFP.Store(tt.ID, fp2)
+	e.slot(tt.ID).storeGoalFP(fp2)
 	if err := store.SetIntentState(iid, "done"); err != nil {
 		t.Fatal(err)
 	}
