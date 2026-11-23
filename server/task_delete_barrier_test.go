@@ -188,11 +188,13 @@ func TestStopTaskCancelsRuntimeAndClearsLifecycleState(t *testing.T) {
 	const taskID = "42"
 	e.deleteMu.RLock()
 	rt := e.registerTaskRoutines(context.Background(), taskID, 1)
-	e.started.Store(taskID, true)
-	e.lastAct.Store(taskID, int64(1))
-	e.paused.Store(taskID, true)
-	e.plannerRound.Store(taskID, 3)
-	e.coordStarted.Store(taskID, true)
+	sl := e.slot(taskID)
+	sl.setStarted(true)
+	sl.setLastActUnix(1)
+	sl.setPaused(true)
+	sl.setPlannerRound(3)
+	sl.setCoordStarted(true)
+	sl.storeGoalFP("quiet-mode-fp")
 	e.deleteMu.RUnlock()
 
 	done := make(chan struct{})
@@ -211,14 +213,8 @@ func TestStopTaskCancelsRuntimeAndClearsLifecycleState(t *testing.T) {
 		t.Fatalf("task lifecycle maps were not cleared: started=%v paused=%v deleting=%v",
 			e.Started(taskID), e.IsPaused(taskID), e.IsDeleting(taskID))
 	}
-	if _, ok := e.lastAct.Load(taskID); ok {
-		t.Fatal("last activity state was retained")
-	}
-	if _, ok := e.plannerRound.Load(taskID); ok {
-		t.Fatal("planner round state was retained")
-	}
-	if _, ok := e.coordStarted.Load(taskID); ok {
-		t.Fatal("deadline coordinator state was retained")
+	if _, ok := e.slots.Load(taskID); ok {
+		t.Fatal("task slot retained after StopTask (goalFP and other fields must go with it)")
 	}
 	e.runtimeMu.Lock()
 	_, retained := e.runtimes[taskID]

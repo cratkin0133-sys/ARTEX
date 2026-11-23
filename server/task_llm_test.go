@@ -570,7 +570,7 @@ func TestEngineReadyForTaskOverride(t *testing.T) {
 func TestResolvedTaskStatusKeepsExhaustedStartedTaskRunning(t *testing.T) {
 	t.Parallel()
 	engine := NewEngine(nil)
-	engine.started.Store("7", true)
+	engine.slot("7").setStarted(true)
 	task := &Task{ID: "7", Status: "running"}
 	profileID := int64(11)
 	task.setLLMState(&profileID, nil, []int64{profileID}, 1, "chain_exhausted", "quota exhausted")

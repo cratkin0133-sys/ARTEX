@@ -74,7 +74,7 @@ func TestAdmitAlreadyRunningTaskDoesNotQueueAfterLimitDecrease(t *testing.T) {
 	s := newAdmissionTestServer(m, nil)
 	// Simulate a task whose long-lived loops were admitted before the limit was
 	// lowered. The other live task makes the current count exceed the new limit.
-	s.engine.started.Store(running.ID, true)
+	s.engine.slot(running.ID).setStarted(true)
 	queued, err := s.admitTask(running, "resume")
 	if err != nil {
 		t.Fatal(err)
@@ -247,10 +247,11 @@ func TestTimedOutTaskRevivalResetsClockAndSettlingAcrossFIFO(t *testing.T) {
 	}
 
 	s := newAdmissionTestServer(m, nil)
-	s.engine.settling.Store(task.ID, true)
-	s.engine.deadline.Store(task.ID, oldClock.DeadlineAt)
-	s.engine.stamped.Store(task.ID, true)
-	s.engine.coordStarted.Store(task.ID, true)
+	sl := s.engine.slot(task.ID)
+	sl.setSettling(true)
+	sl.setDeadline(oldClock.DeadlineAt)
+	sl.setStamped(true)
+	sl.setCoordStarted(true)
 
 	queued, err := s.admitTask(task, "resume")
 	if err != nil {
@@ -264,10 +265,10 @@ func TestTimedOutTaskRevivalResetsClockAndSettlingAcrossFIFO(t *testing.T) {
 	if s.engine.isSettling(task.ID) {
 		t.Fatal("timed-out task retained the old settling gate while queued")
 	}
-	if _, ok := s.engine.deadline.Load(task.ID); ok {
+	if _, ok := sl.getDeadline(); ok {
 		t.Fatal("timed-out task retained the old in-memory deadline")
 	}
-	if _, ok := s.engine.stamped.Load(task.ID); ok {
+	if sl.isStamped() {
 		t.Fatal("timed-out task retained the old first-run stamp")
 	}
 	stored, err := m.pg.GetTask(mustTaskID(t, task.ID))
@@ -293,7 +294,7 @@ func TestTimedOutTaskRevivalResetsClockAndSettlingAcrossFIFO(t *testing.T) {
 	if execCtx := s.engine.execContextFor(context.Background(), task.ID); execCtx.Err() != nil {
 		t.Fatalf("revived task did not receive a live execution context: %v", context.Cause(execCtx))
 	}
-	if _, ok := s.engine.coordStarted.Load(task.ID); !ok {
+	if !s.engine.slot(task.ID).hasCoordStarted() {
 		t.Fatal("revived timeout task did not start a fresh deadline coordinator")
 	}
 }
@@ -419,7 +420,7 @@ func TestUnavailableTaskReleasesSlotForReadyQueue(t *testing.T) {
 		_, _ = m.DeleteTask(ready.ID, DeleteTaskOptions{})
 	}()
 	s := newAdmissionTestServer(m, func(task *Task) bool { return task.ID != unavailable.ID })
-	s.engine.started.Store(unavailable.ID, true)
+	s.engine.slot(unavailable.ID).setStarted(true)
 	if err := m.EnqueueTask(ready.ID, "resume"); err != nil {
 		t.Fatal(err)
 	}
@@ -460,7 +461,7 @@ func TestUnavailableTaskWaitsForActiveLLMCallBeforeParking(t *testing.T) {
 
 	available := map[string]bool{active.ID: true, waiting.ID: true}
 	s := newAdmissionTestServer(m, func(task *Task) bool { return available[task.ID] })
-	s.engine.started.Store(active.ID, true)
+	s.engine.slot(active.ID).setStarted(true)
 	if err := m.EnqueueTask(waiting.ID, "resume"); err != nil {
 		t.Fatal(err)
 	}

@@ -55,7 +55,7 @@ func TestResetSettledRunRestartsBudget(t *testing.T) {
 	t.Setenv("ARTEX_INTENT_BUDGET_TURNS", "")
 	ctx, task := context.Background(), &Task{ID: "9"}
 	e := NewEngine(nil)
-	e.settling.Store(task.ID, true)
+	e.slot(task.ID).setSettling(true)
 	l := e.budgetFor(task.ID)
 	l.Record(llm.Usage{InputTokens: 90_000})
 	l.BeginWrapup()
@@ -113,7 +113,7 @@ func TestResetSettledRunReseedsBudgetFromUsage(t *testing.T) {
 
 	l.Record(llm.Usage{InputTokens: 1000})
 	l.BeginWrapup()
-	e.settling.Store(task.ID, true)
+	e.slot(task.ID).setSettling(true)
 	e.resetSettledRun(task.ID)
 	if e.isSettling(task.ID) {
 		t.Fatal("revived run is still marked settling")
