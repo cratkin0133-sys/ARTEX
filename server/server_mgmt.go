@@ -364,7 +364,7 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 		InteractiveShell *bool `json:"interactive_shell"`
 		// llm_profile_id is tri-state: field omitted = leave unchanged; explicit null = unbind (follow task/global); number = bind that profile.
 		LLMProfileID json.RawMessage `json:"llm_profile_id"`
-		// P3 post-trigger handling policy (the three are optional as a group; providing any one writes the whole set; none provided = leave unchanged).
+		// P3 post-trigger handling policy; each field is optional and an omitted one is left unchanged.
 		TriggerRunMode     *string `json:"trigger_run_mode"`
 		TriggerMergeMode   *string `json:"trigger_merge_mode"`
 		TriggerMaxParallel *int    `json:"trigger_max_parallel"`
@@ -373,15 +373,14 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	profileChanged := false
 	patch := db.AgentConfigPatch{
-		MaxTurns:         req.MaxTurns,
-		RunSeconds:       req.RunSeconds,
-		WebSearch:        req.WebSearch,
-		InteractiveShell: req.InteractiveShell,
-		TriggerRunMode:   req.TriggerRunMode,
-		TriggerMergeMode: req.TriggerMergeMode,
-		TriggerMaxPar:    req.TriggerMaxParallel,
+		MaxTurns:           req.MaxTurns,
+		RunSeconds:         req.RunSeconds,
+		WebSearch:          req.WebSearch,
+		InteractiveShell:   req.InteractiveShell,
+		TriggerRunMode:     req.TriggerRunMode,
+		TriggerMergeMode:   req.TriggerMergeMode,
+		TriggerMaxParallel: req.TriggerMaxParallel,
 	}
 	if req.LLMProfileID != nil {
 		var id *int64
@@ -394,29 +393,21 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 				writeErr(w, 400, "the specified LLM profile does not exist or is invalid")
 				return
 			}
-			patch.LLMProfileID = id
-		} else {
-			patch.ClearLLMProfile = true
 		}
-		profileChanged = true
+		patch.LLMProfileID = &id
 	}
-	if req.MaxTurns == nil && req.RunSeconds == nil && req.WebSearch == nil && req.InteractiveShell == nil &&
-		req.LLMProfileID == nil && req.TriggerRunMode == nil && req.TriggerMergeMode == nil && req.TriggerMaxParallel == nil {
-		writeErr(w, 400, "nothing to update")
-		return
-	}
-	ok, err := pg.PatchAgentConfig(r.Context(), a.Key, patch)
+	found, err := pg.PatchAgentConfig(r.Context(), a.Key, patch)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	if !ok {
+	if !found {
 		writeErr(w, 404, "agent not found")
 		return
 	}
 	// an agent's LLM binding change also invalidates pinned-task / per-profile caches
 	// so their next round re-resolves each agent's bound model.
-	if profileChanged {
+	if req.LLMProfileID != nil {
 		s.invalidateProfileAgents()
 	}
 	// Task bundles capture operational Agent settings (turn/time budgets, tools,

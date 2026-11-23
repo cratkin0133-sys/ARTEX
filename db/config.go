@@ -634,42 +634,13 @@ func (d *DB) DeleteAgent(key string) error {
 	return err
 }
 
-// SetAgentMaxTurns updates an agent's max_turns (0 = unlimited).
-func (d *DB) SetAgentMaxTurns(key string, maxTurns int) error {
-	if maxTurns < 0 {
-		maxTurns = 0
-	}
-	_, err := d.Exec(`UPDATE agents SET max_turns=$1 WHERE key=$2`, maxTurns, key)
-	return err
-}
-
 // SetAgentLLMProfile binds an agent to a specific LLM profile (id != nil), or clears
 // the binding (id == nil) so the agent follows the task/conversation pin, else the
 // global active profile. Precedence at runtime: agent binding → task/conv pin → active.
+// An unknown key is a no-op.
 func (d *DB) SetAgentLLMProfile(key string, id *int64) error {
-	tx, err := d.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	// DeleteProfile locks reference rows before the profile row. Keep the same
-	// order here so a concurrent rebind cannot form a child/profile deadlock.
-	var agentID int64
-	if err := tx.QueryRow(`SELECT id FROM agents WHERE key=$1 FOR UPDATE`, key).Scan(&agentID); err != nil {
-		if err == sql.ErrNoRows {
-			// Preserve the previous UPDATE semantics: an unknown key is a no-op.
-			return tx.Commit()
-		}
-		return err
-	}
-	if err := lockLLMProfileForReference(tx, id); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`UPDATE agents SET llm_profile_id=$1 WHERE id=$2`, id, agentID); err != nil {
-		return err
-	}
-	return tx.Commit()
+	_, err := d.PatchAgentConfig(context.Background(), key, AgentConfigPatch{LLMProfileID: &id})
+	return err
 }
 
 // lockLLMProfileForReference makes the profile side of the shared lock-order
@@ -686,21 +657,6 @@ func lockLLMProfileForReference(tx *sql.Tx, profileID *int64) error {
 		return err
 	}
 	return nil
-}
-
-// SetAgentWebSearch toggles whether an agent uses network search (still gated by
-// the global web-search master switch + backend/key config).
-func (d *DB) SetAgentWebSearch(key string, on bool) error {
-	_, err := d.Exec(`UPDATE agents SET web_search=$1 WHERE key=$2`, on, key)
-	return err
-}
-
-// SetAgentInteractiveShell toggles whether an agent gets the interactive shell
-// (persistent PTY session) tool family + Bash prompt linkage (see
-// docs/interactive-shell-design.md §14.2).
-func (d *DB) SetAgentInteractiveShell(key string, on bool) error {
-	_, err := d.Exec(`UPDATE agents SET interactive_shell=$1 WHERE key=$2`, on, key)
-	return err
 }
 
 // SetAgentWrapupPrompt stores an agent's wrap-up (settlement) prompt. Empty string
@@ -725,35 +681,13 @@ func (d *DB) SetAgentTaskTimeoutWrapup(key, prompt string, maxTurns int) error {
 	return err
 }
 
-// SetAgentRunSeconds updates an agent's run_seconds wall-clock budget (0 = unlimited).
-func (d *DB) SetAgentRunSeconds(key string, runSecs int) error {
-	if runSecs < 0 {
-		runSecs = 0
-	}
-	_, err := d.Exec(`UPDATE agents SET run_seconds=$1 WHERE key=$2`, runSecs, key)
-	return err
-}
-
 // SetAgentTriggerBehavior stores an agent's P3 trigger post-processing policy:
 // runMode(serial|parallel) / mergeMode(by_task|all|none) / maxParallel (for parallel; 0 = unlimited).
 // Enums are whitelist-validated; invalid values fall back to defaults, so dirty
 // data cannot throw off the scheduling pump.
 func (d *DB) SetAgentTriggerBehavior(key, runMode, mergeMode string, maxParallel int) error {
-	switch runMode {
-	case "serial", "parallel":
-	default:
-		runMode = "serial"
-	}
-	switch mergeMode {
-	case "by_task", "all", "none":
-	default:
-		mergeMode = "by_task"
-	}
-	if maxParallel < 0 {
-		maxParallel = 0
-	}
 	_, err := d.Exec(`UPDATE agents SET trigger_run_mode=$1, trigger_merge_mode=$2, trigger_max_parallel=$3 WHERE key=$4`,
-		runMode, mergeMode, maxParallel, key)
+		triggerRunMode(runMode), triggerMergeMode(mergeMode), max(maxParallel, 0), key)
 	return err
 }
 

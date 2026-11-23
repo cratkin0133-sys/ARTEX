@@ -3,114 +3,101 @@ package db
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"strings"
 )
 
-// AgentConfigPatch groups optional agent runtime config updates for one transaction.
+// AgentConfigPatch holds the agent runtime settings one config save changes;
+// nil leaves a setting as it is. LLMProfileID is tri-state: nil leaves the
+// binding, a pointer to nil unbinds, a pointer to an id binds that profile.
 type AgentConfigPatch struct {
-	MaxTurns         *int
-	RunSeconds       *int
-	WebSearch        *bool
-	InteractiveShell *bool
-	LLMProfileID     *int64 // nil pointer in patch means clear binding; absent field handled by caller
-	ClearLLMProfile  bool
-	TriggerRunMode   *string
-	TriggerMergeMode *string
-	TriggerMaxPar    *int
+	MaxTurns           *int
+	RunSeconds         *int
+	WebSearch          *bool
+	InteractiveShell   *bool
+	LLMProfileID       **int64
+	TriggerRunMode     *string
+	TriggerMergeMode   *string
+	TriggerMaxParallel *int
 }
 
-// PatchAgentConfig applies all provided fields in one transaction.
-func (d *DB) PatchAgentConfig(ctx context.Context, key string, patch AgentConfigPatch) (bool, error) {
+// PatchAgentConfig writes every set field of patch with one UPDATE in one
+// transaction, so a failure leaves the agent unchanged. found is false, with
+// nothing written, when no agent has that key. Negative budgets clamp to 0 and
+// unknown trigger modes fall back to their defaults. Binding a profile that
+// does not exist returns ErrLLMProfileNotFound.
+func (d *DB) PatchAgentConfig(ctx context.Context, key string, patch AgentConfigPatch) (found bool, err error) {
 	tx, err := d.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
 	defer tx.Rollback()
 
+	// DeleteProfile locks reference rows before the profile row. Keep the same
+	// order here so a concurrent rebind cannot form a child/profile deadlock.
 	var agentID int64
-	if err := tx.QueryRowContext(ctx, `SELECT id FROM agents WHERE key=$1 FOR UPDATE`, key).Scan(&agentID); err != nil {
-		if err == sql.ErrNoRows {
-			return false, nil
-		}
+	switch err := tx.QueryRowContext(ctx, `SELECT id FROM agents WHERE key=$1 FOR UPDATE`, key).Scan(&agentID); {
+	case err == sql.ErrNoRows:
+		return false, nil
+	case err != nil:
 		return false, err
 	}
-
-	if patch.ClearLLMProfile || patch.LLMProfileID != nil {
-		var profileID *int64
-		if !patch.ClearLLMProfile {
-			profileID = patch.LLMProfileID
+	args := []any{agentID}
+	var sets []string
+	set := func(col string, v any) {
+		args = append(args, v)
+		sets = append(sets, fmt.Sprintf("%s=$%d", col, len(args)))
+	}
+	if patch.LLMProfileID != nil {
+		if err := lockLLMProfileForReference(tx, *patch.LLMProfileID); err != nil {
+			return true, err
 		}
-		if err := lockLLMProfileForReference(tx, profileID); err != nil {
-			return false, err
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE agents SET llm_profile_id=$1 WHERE id=$2`, profileID, agentID); err != nil {
-			return false, err
-		}
+		set("llm_profile_id", *patch.LLMProfileID)
 	}
 	if patch.MaxTurns != nil {
-		mt := *patch.MaxTurns
-		if mt < 0 {
-			mt = 0
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE agents SET max_turns=$1 WHERE id=$2`, mt, agentID); err != nil {
-			return false, err
-		}
+		set("max_turns", max(*patch.MaxTurns, 0))
 	}
 	if patch.RunSeconds != nil {
-		rs := *patch.RunSeconds
-		if rs < 0 {
-			rs = 0
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE agents SET run_seconds=$1 WHERE id=$2`, rs, agentID); err != nil {
-			return false, err
-		}
+		set("run_seconds", max(*patch.RunSeconds, 0))
 	}
 	if patch.WebSearch != nil {
-		if _, err := tx.ExecContext(ctx, `UPDATE agents SET web_search=$1 WHERE id=$2`, *patch.WebSearch, agentID); err != nil {
-			return false, err
-		}
+		set("web_search", *patch.WebSearch)
 	}
 	if patch.InteractiveShell != nil {
-		if _, err := tx.ExecContext(ctx, `UPDATE agents SET interactive_shell=$1 WHERE id=$2`, *patch.InteractiveShell, agentID); err != nil {
-			return false, err
+		set("interactive_shell", *patch.InteractiveShell)
+	}
+	if patch.TriggerRunMode != nil {
+		set("trigger_run_mode", triggerRunMode(*patch.TriggerRunMode))
+	}
+	if patch.TriggerMergeMode != nil {
+		set("trigger_merge_mode", triggerMergeMode(*patch.TriggerMergeMode))
+	}
+	if patch.TriggerMaxParallel != nil {
+		set("trigger_max_parallel", max(*patch.TriggerMaxParallel, 0))
+	}
+	if len(sets) > 0 {
+		if _, err := tx.ExecContext(ctx, `UPDATE agents SET `+strings.Join(sets, ", ")+` WHERE id=$1`, args...); err != nil {
+			return true, err
 		}
 	}
-	if patch.TriggerRunMode != nil || patch.TriggerMergeMode != nil || patch.TriggerMaxPar != nil {
-		var runMode, mergeMode string
-		var maxPar int
-		if err := tx.QueryRowContext(ctx, `SELECT trigger_run_mode, trigger_merge_mode, trigger_max_parallel FROM agents WHERE id=$1`, agentID).
-			Scan(&runMode, &mergeMode, &maxPar); err != nil {
-			return false, err
-		}
-		if patch.TriggerRunMode != nil {
-			runMode = *patch.TriggerRunMode
-		}
-		if patch.TriggerMergeMode != nil {
-			mergeMode = *patch.TriggerMergeMode
-		}
-		if patch.TriggerMaxPar != nil {
-			maxPar = *patch.TriggerMaxPar
-		}
-		switch runMode {
-		case "serial", "parallel":
-		default:
-			runMode = "serial"
-		}
-		switch mergeMode {
-		case "by_task", "all", "none":
-		default:
-			mergeMode = "by_task"
-		}
-		if maxPar < 0 {
-			maxPar = 0
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE agents SET trigger_run_mode=$1, trigger_merge_mode=$2, trigger_max_parallel=$3 WHERE id=$4`,
-			runMode, mergeMode, maxPar, agentID); err != nil {
-			return false, err
-		}
-	}
+	return true, tx.Commit()
+}
 
-	if err := tx.Commit(); err != nil {
-		return false, err
+// triggerRunMode whitelists a trigger run mode so dirty input cannot throw off
+// the scheduling pump; anything unknown runs serially.
+func triggerRunMode(mode string) string {
+	if mode == "parallel" {
+		return mode
 	}
-	return true, nil
+	return "serial"
+}
+
+// triggerMergeMode whitelists a serial-queue merge mode; anything unknown
+// merges by task.
+func triggerMergeMode(mode string) string {
+	switch mode {
+	case "all", "none":
+		return mode
+	}
+	return "by_task"
 }
