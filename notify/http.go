@@ -9,11 +9,14 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/Autumn-27/artex/netguard"
 )
 
 // allowLocalTargets decides whether delivering messages to loopback / link-local
@@ -59,13 +62,11 @@ func isBlockedDialIP(ip net.IP) bool {
 	if ip == nil {
 		return true
 	}
-	// IPv4-mapped IPv6 (::ffff:127.0.0.1) must be converted back to IPv4 before
-	// the check, otherwise it bypasses it.
-	if v4 := ip.To4(); v4 != nil {
-		ip = v4
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return true
 	}
-	return ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
-		ip.IsInterfaceLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast()
+	return netguard.NotifyDialBlocked(addr, false)
 }
 
 // blockInternalDial is the Control hook of the http.Transport dialer, checking
@@ -85,12 +86,12 @@ func blockInternalDial(_, address string, _ syscall.RawConn) error {
 	if err != nil {
 		return err
 	}
-	ip := net.ParseIP(host)
-	if ip == nil {
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
 		return fmt.Errorf("cannot parse target address %q", host)
 	}
-	if isBlockedDialIP(ip) {
-		return fmt.Errorf("refusing to deliver to loopback/link-local address %s (if you really need to deliver to a local service, set %s=1)", ip, AllowLocalTargetsEnv)
+	if netguard.NotifyDialBlocked(addr, allowLocalTargets()) {
+		return fmt.Errorf("refusing to deliver to loopback/link-local address %s (if you really need to deliver to a local service, set %s=1)", addr, AllowLocalTargetsEnv)
 	}
 	return nil
 }

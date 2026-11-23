@@ -1,7 +1,6 @@
 package server
 
 import (
-	"encoding/json"
 	"net/http"
 
 	"github.com/Autumn-27/artex/traffic"
@@ -28,7 +27,7 @@ func (s *Server) ingestTraffic(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Exchanges []traffic.ExternalExchange `json:"exchanges"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32<<20)).Decode(&req); err != nil {
+	if err := decode(w, r, &req); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())
 		return
 	}

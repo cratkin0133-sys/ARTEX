@@ -77,6 +77,9 @@ func TestIsBlockedDialIP(t *testing.T) {
 	blocked := []string{
 		"127.0.0.1", "127.1.2.3", "::1",
 		"169.254.169.254", // cloud metadata endpoint — the main reason this function exists
+		"100.100.100.200",
+		"64:ff9b::a9fe:a9fe", // NAT64 of metadata
+		"64:ff9b::7f00:1",    // NAT64 of loopback
 		"169.254.1.1", "fe80::1",
 		"0.0.0.0", "::",
 		"224.0.0.1", "ff02::1",
