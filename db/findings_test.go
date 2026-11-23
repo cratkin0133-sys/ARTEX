@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Autumn-27/artex/notify"
 )
 
 // TestDeleteFinding verifies that deleting a finding removes both the findings
@@ -142,6 +144,139 @@ func TestSetFindingStatusMirrorsNodePayload(t *testing.T) {
 	}
 }
 
+// patchFindingFixture records one finding on a finding node; both are removed
+// with the test.
+func patchFindingFixture(t *testing.T) (d *DB, fid, nodeID int64) {
+	t.Helper()
+	d, err := Open(testDSN(t))
+	if err != nil {
+		SkipPGUnavailable(t, err)
+	}
+	t.Cleanup(func() { d.Close() })
+	tk, err := d.CreateTask("patch finding", "goal", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.DeleteTask(tk.ID) })
+	nodeID, err = d.Exploration(tk.ExplorationID).AddNode(KindFinding, map[string]any{"summary": "x", "severity": "high"}, 5, "confirmed", "worker", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fid, err = d.AddFinding(tk.ID, nodeID, "XSS", "reflected XSS", "high", "summary", "poc", "worker", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = d.Exec(`DELETE FROM notification_events WHERE finding_id=$1`, fid)
+		_, _ = d.DeleteFinding(fid)
+	})
+	return d, fid, nodeID
+}
+
+func findingNodePayload(t *testing.T, d *DB, nodeID int64) map[string]any {
+	t.Helper()
+	var raw []byte
+	if err := d.QueryRow(`SELECT payload FROM exploration_nodes WHERE id=$1`, nodeID).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	var p map[string]any
+	if err := json.Unmarshal(raw, &p); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func statusChangeSnapshots(t *testing.T, d *DB, fid int64) []notify.Snapshot {
+	t.Helper()
+	rows, err := d.Query(`SELECT snapshot FROM notification_events WHERE finding_id=$1 AND kind=$2 ORDER BY id`, fid, notify.EventFindingStatusChanged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []notify.Snapshot
+	for rows.Next() {
+		var raw []byte
+		var s notify.Snapshot
+		if err := rows.Scan(&raw); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(raw, &s); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func TestPatchFindingAppliesEveryField(t *testing.T) {
+	d, fid, nodeID := patchFindingFixture(t)
+	ctx := context.Background()
+	status, report, severity, name, vulnclass := FindingConfirmed, FindingReportSubmitted, "critical", "renamed", "SQLi"
+	f, found, err := d.PatchFinding(ctx, fid, FindingPatch{
+		Status: &status, ReportState: &report, Severity: &severity, Name: &name, VulnClass: &vulnclass,
+	})
+	if err != nil || !found {
+		t.Fatalf("PatchFinding: found=%v err=%v", found, err)
+	}
+	if f.Status != status || f.ReportState != report || f.Severity != severity || f.Name != name || f.VulnClass != vulnclass {
+		t.Fatalf("returned finding: %+v", f)
+	}
+	payload := findingNodePayload(t, d, nodeID)
+	for key, want := range map[string]string{"status": status, "report_state": report, "severity": severity, "name": name, "vulnclass": vulnclass} {
+		if payload[key] != want {
+			t.Errorf("node payload %s=%v, want %q", key, payload[key], want)
+		}
+	}
+	// One status-change push, describing the finding as the patch left it.
+	snaps := statusChangeSnapshots(t, d, fid)
+	if len(snaps) != 1 {
+		t.Fatalf("want 1 status-change event, got %d", len(snaps))
+	}
+	if s := snaps[0]; s.FromStatus != FindingPending || s.ToStatus != status || s.Severity != severity || s.Name != name || s.VulnClass != vulnclass {
+		t.Fatalf("status-change snapshot: %+v", s)
+	}
+
+	again, found, err := d.PatchFinding(ctx, fid, FindingPatch{})
+	if err != nil || !found || again.Severity != severity {
+		t.Fatalf("empty patch: found=%v err=%v finding=%+v", found, err, again)
+	}
+	if n := len(statusChangeSnapshots(t, d, fid)); n != 1 {
+		t.Fatalf("empty patch registered events: %d", n)
+	}
+}
+
+func TestPatchFindingRollsBackEveryFieldOnError(t *testing.T) {
+	d, fid, nodeID := patchFindingFixture(t)
+	before, err := d.GetFinding(fid)
+	if err != nil || before == nil {
+		t.Fatalf("GetFinding: %+v err=%v", before, err)
+	}
+	// PostgreSQL rejects a NUL byte in text, so this patch cannot commit.
+	status, report, severity, name, vulnclass := "confirmed\x00", FindingReportSubmitted, "critical", "renamed", "SQLi"
+	if _, _, err := d.PatchFinding(context.Background(), fid, FindingPatch{
+		Status: &status, ReportState: &report, Severity: &severity, Name: &name, VulnClass: &vulnclass,
+	}); err == nil {
+		t.Fatal("PatchFinding with a NUL byte in status: want an error")
+	}
+	after, err := d.GetFinding(fid)
+	if err != nil || after == nil {
+		t.Fatalf("GetFinding: %+v err=%v", after, err)
+	}
+	if after.Status != before.Status || after.ReportState != before.ReportState || after.Severity != before.Severity ||
+		after.Name != before.Name || after.VulnClass != before.VulnClass {
+		t.Fatalf("failed patch left writes behind:\nbefore %+v\nafter  %+v", before, after)
+	}
+	if p := findingNodePayload(t, d, nodeID); p["severity"] != "high" || p["name"] != nil || p["vulnclass"] != nil || p["report_state"] != nil {
+		t.Fatalf("failed patch left node payload writes behind: %v", p)
+	}
+	if n := len(statusChangeSnapshots(t, d, fid)); n != 0 {
+		t.Fatalf("failed patch registered %d status-change events", n)
+	}
+}
+
 func TestFindingReportState(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
@@ -179,9 +314,9 @@ func TestFindingReportState(t *testing.T) {
 		t.Fatalf("new finding report_state: %+v err=%v", one, err)
 	}
 
-	n, err := d.SetFindingReportState(fid, FindingReportSubmitted)
-	if err != nil || n != 1 {
-		t.Fatalf("SetFindingReportState: n=%d err=%v", n, err)
+	submitted := FindingReportSubmitted
+	if _, found, err := d.PatchFinding(context.Background(), fid, FindingPatch{ReportState: &submitted}); err != nil || !found {
+		t.Fatalf("PatchFinding report_state: found=%v err=%v", found, err)
 	}
 	one, _ = d.GetFinding(fid)
 	if one.ReportState != FindingReportSubmitted {
@@ -403,16 +538,13 @@ func TestFindingsPageAndStats(t *testing.T) {
 		t.Fatalf("GetFinding(-1): want nil,nil got %+v,%v", miss, err)
 	}
 
-	// SetFindingSeverity: standalone row updates; 0 rows for unknown id.
-	if n, err := d.SetFindingSeverity(ids[0], "high"); err != nil || n != 1 {
-		t.Fatalf("SetFindingSeverity: want 1,nil got %d,%v", n, err)
+	// PatchFinding: standalone row updates; not found for unknown id.
+	high, low := "high", "low"
+	if one, found, err := d.PatchFinding(context.Background(), ids[0], FindingPatch{Severity: &high}); err != nil || !found || one.Severity != "high" {
+		t.Fatalf("PatchFinding severity: found=%v err=%v finding=%+v", found, err, one)
 	}
-	one, _ = d.GetFinding(ids[0])
-	if one.Severity != "high" {
-		t.Fatalf("severity not updated: %q", one.Severity)
-	}
-	if n, err := d.SetFindingSeverity(-1, "low"); err != nil || n != 0 {
-		t.Fatalf("SetFindingSeverity(-1): want 0,nil got %d,%v", n, err)
+	if one, found, err := d.PatchFinding(context.Background(), -1, FindingPatch{Severity: &low}); err != nil || found || one != nil {
+		t.Fatalf("PatchFinding(-1): want nil,false,nil got %+v,%v,%v", one, found, err)
 	}
 }
 

@@ -866,14 +866,6 @@ func (d *DB) SetFindingStatus(id int64, status string) (int64, error) {
 	return 1, nil
 }
 
-// SetFindingReportState updates one finding's report stage and mirrors it onto
-// the originating exploration node's payload under "report_state". It does not
-// register a status-change notification: report_state is a workflow stage, not
-// a triage verdict. Returns rows affected.
-func (d *DB) SetFindingReportState(id int64, state string) (int64, error) {
-	return d.setFindingCol(id, "report_state", "report_state", state)
-}
-
 // FindingReportStateBatchResult is one id's outcome in a bulk report-stage update.
 type FindingReportStateBatchResult struct {
 	ID      int64  `json:"id"`
@@ -936,47 +928,6 @@ FROM findings WHERE id=$1 FOR UPDATE`, id).Scan(&from, &nodeID)
 // can address the finding it just created. Returns rows affected (0 when no row).
 func (d *DB) SetFindingReportByNodeID(nodeID int64, report string) (int64, error) {
 	return d.SetFindingReportVersionByNodeID(context.Background(), nodeID, report, nil)
-}
-
-// setFindingCol updates one text column on the standalone finding row AND mirrors
-// the new value into the originating exploration node's payload under jsonKey, so the
-// per-task Findings tab (which reads the node payload, not this table) stays in sync.
-// Returns rows affected (0 when no finding has that id); the node sync is best-effort.
-// col and jsonKey MUST be trusted constants (they are interpolated into SQL) — never
-// pass user input.
-func (d *DB) setFindingCol(id int64, col, jsonKey, val string) (int64, error) {
-	var nodeID *int64
-	err := d.QueryRow(`UPDATE findings SET `+col+`=$1 WHERE id=$2 RETURNING node_id`, val, id).Scan(&nodeID)
-	if err == sql.ErrNoRows {
-		return 0, nil
-	}
-	if err != nil {
-		return 0, err
-	}
-	if nodeID != nil {
-		_, _ = d.Exec(`UPDATE exploration_nodes
-			SET payload = jsonb_set(payload, '{`+jsonKey+`}', to_jsonb($1::text))
-			WHERE id = $2`, val, *nodeID)
-	}
-	return 1, nil
-}
-
-// SetFindingSeverity updates one finding's severity (+ node payload sync). Returns
-// rows affected (0 when no finding has that id).
-func (d *DB) SetFindingSeverity(id int64, severity string) (int64, error) {
-	return d.setFindingCol(id, "severity", "severity", severity)
-}
-
-// SetFindingName updates one finding's vulnerability name (+ node payload
-// sync). Empty name is allowed — the frontend falls back to the vuln class for
-// display.
-func (d *DB) SetFindingName(id int64, name string) (int64, error) {
-	return d.setFindingCol(id, "name", "name", name)
-}
-
-// SetFindingVulnClass updates one finding's vulnerability class (+ node payload sync).
-func (d *DB) SetFindingVulnClass(id int64, vulnclass string) (int64, error) {
-	return d.setFindingCol(id, "vulnclass", "vulnclass", vulnclass)
 }
 
 // FindingMeta is the standalone-row data (id, triage state, anchored assets) the
