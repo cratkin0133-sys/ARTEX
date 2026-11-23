@@ -52,21 +52,16 @@ func allowLocalTargets() bool {
 // allowed for delivery by default".
 //
 // Only loopback, link-local (including the cloud metadata 169.254.169.254),
-// unspecified, and multicast are rejected. RFC1918 private networks are **not**
-// rejected: self-hosted Mattermost / SMTP relays on an intranet are very common
-// legitimate uses, and blocking them too would make the feature flat-out
-// unusable in real environments. This trade-off is deliberate — the protection
-// must stop the truly sensitive targets without killing normal deployments along
-// the way.
+// unspecified, multicast and the other instance-metadata addresses are
+// rejected, also behind their IPv4-mapped, NAT64 and 6to4 forms. RFC1918
+// private networks are **not** rejected: self-hosted Mattermost / SMTP relays
+// on an intranet are very common legitimate uses, and blocking them too would
+// make the feature flat-out unusable in real environments. This trade-off is
+// deliberate — the protection must stop the truly sensitive targets without
+// killing normal deployments along the way.
 func isBlockedDialIP(ip net.IP) bool {
-	if ip == nil {
-		return true
-	}
 	addr, ok := netip.AddrFromSlice(ip)
-	if !ok {
-		return true
-	}
-	return netguard.NotifyDialBlocked(addr, false)
+	return !ok || netguard.NotifyDialBlocked(addr, false)
 }
 
 // blockInternalDial is the Control hook of the http.Transport dialer, checking
@@ -79,9 +74,6 @@ func isBlockedDialIP(ip net.IP) bool {
 // (cross-host redirects are already refused, but a same-host redirect can still
 // point the path elsewhere).
 func blockInternalDial(_, address string, _ syscall.RawConn) error {
-	if allowLocalTargets() {
-		return nil
-	}
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
 		return err

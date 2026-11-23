@@ -8,6 +8,8 @@ import (
 	"net/netip"
 	"sync/atomic"
 	"testing"
+
+	"github.com/Autumn-27/artex/netguard"
 )
 
 // A NAT64 address (64:ff9b::/96, the IPv4 address in the low 32 bits) and a
@@ -16,7 +18,6 @@ import (
 // out 64:ff9b::/96 answers for every public IPv4-only provider.
 func TestLLMModelsJudgesNAT64And6to4ByEmbeddedIPv4(t *testing.T) {
 	t.Setenv(LLMPrivateEndpointsEnv, "")
-	s := &Server{}
 	for _, tc := range []struct {
 		addr, what  string
 		wantBlocked bool
@@ -48,7 +49,7 @@ func TestLLMModelsJudgesNAT64And6to4ByEmbeddedIPv4(t *testing.T) {
 		{"64:ff9b::1:a9fe:a9fe", "outside 64:ff9b::/96", false},
 	} {
 		t.Run(tc.addr, func(t *testing.T) {
-			if got := s.isBlockedModelAddr(netip.MustParseAddr(tc.addr), false); got != tc.wantBlocked {
+			if got := netguard.ModelDialBlocked(netip.MustParseAddr(tc.addr), netguard.ModelPolicy{}); got != tc.wantBlocked {
 				t.Errorf("%s: blocked=%v, want %v", tc.what, got, tc.wantBlocked)
 			}
 		})
@@ -153,7 +154,6 @@ func TestLLMModelsListsThroughNAT64Address(t *testing.T) {
 // 6to4 address, what it gets as a bare IPv4 address: private, loopback and
 // shared ranges are allowed, link-local, metadata and reserved ones never.
 func TestLLMModelsPrivateEndpointListCoversEmbeddedIPv4(t *testing.T) {
-	s := &Server{}
 	for _, tc := range []struct {
 		addr, what  string
 		wantBlocked bool
@@ -171,7 +171,7 @@ func TestLLMModelsPrivateEndpointListCoversEmbeddedIPv4(t *testing.T) {
 		{"64:ff9b::", "NAT64 of 0.0.0.0", true},
 	} {
 		t.Run(tc.addr, func(t *testing.T) {
-			if got := s.isBlockedModelAddr(netip.MustParseAddr(tc.addr), true); got != tc.wantBlocked {
+			if got := netguard.ModelDialBlocked(netip.MustParseAddr(tc.addr), netguard.ModelPolicy{AllowPrivateEndpoint: true}); got != tc.wantBlocked {
 				t.Errorf("allow-listed %s: blocked=%v, want %v", tc.what, got, tc.wantBlocked)
 			}
 		})

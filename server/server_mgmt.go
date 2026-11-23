@@ -2274,14 +2274,6 @@ func sameRedirectHost(a, b *url.URL) bool {
 	return ha != "" && ha == hb
 }
 
-func (s *Server) isBlockedModelAddr(addr netip.Addr, allowPrivate bool) bool {
-	allowLoopback := s != nil && s.allowLoopbackModels
-	return netguard.ModelDialBlocked(addr, netguard.ModelPolicy{
-		AllowPrivateEndpoint: allowPrivate,
-		AllowLoopbackModels:  allowLoopback,
-	})
-}
-
 func (s *Server) lookupModelIPs(ctx context.Context, host string) ([]netip.Addr, error) {
 	if s != nil && s.modelLookupIP != nil {
 		return s.modelLookupIP(ctx, host)
@@ -2300,6 +2292,13 @@ func newModelURLGuard(s *Server) *modelURLGuard {
 	return &modelURLGuard{
 		s:                s,
 		privateEndpoints: parsePrivateModelEndpoints(os.Getenv(LLMPrivateEndpointsEnv)),
+	}
+}
+
+func (g *modelURLGuard) policy(allowPrivate bool) netguard.ModelPolicy {
+	return netguard.ModelPolicy{
+		AllowPrivateEndpoint: allowPrivate,
+		AllowLoopbackModels:  g.s != nil && g.s.allowLoopbackModels,
 	}
 }
 
@@ -2333,8 +2332,7 @@ func (g *modelURLGuard) blockDial(_, address string, _ syscall.RawConn) error {
 	if err != nil {
 		return &modelURLRefusalError{msg: "target address is not allowed"}
 	}
-	allowPrivate := g.isAllowedDialAddr(addr, port)
-	if g.s.isBlockedModelAddr(addr, allowPrivate) {
+	if netguard.ModelDialBlocked(addr, g.policy(g.isAllowedDialAddr(addr, port))) {
 		return &modelURLRefusalError{msg: "target address is not allowed"}
 	}
 	return nil
@@ -2366,10 +2364,11 @@ func (g *modelURLGuard) validateURL(ctx context.Context, rawURL, role string) (*
 	}
 	hostPort := net.JoinHostPort(normHost, strconv.Itoa(port))
 	allowPrivate := g.privateEndpoints[hostPort]
+	pol := g.policy(allowPrivate)
 
 	if kind == intercept.TargetIP {
 		addr, err := netip.ParseAddr(normHost)
-		if err != nil || g.s.isBlockedModelAddr(addr, allowPrivate) {
+		if err != nil || netguard.ModelDialBlocked(addr, pol) {
 			return nil, &modelURLRefusalError{msg: fmt.Sprintf("%s URL host is not allowed", role)}
 		}
 		if allowPrivate {
@@ -2377,7 +2376,7 @@ func (g *modelURLGuard) validateURL(ctx context.Context, rawURL, role string) (*
 		}
 		return u, nil
 	}
-	if !allowPrivate && !(g.s != nil && g.s.allowLoopbackModels) && (normHost == "localhost" || strings.HasSuffix(normHost, ".localhost")) {
+	if !allowPrivate && !pol.AllowLoopbackModels && (normHost == "localhost" || strings.HasSuffix(normHost, ".localhost")) {
 		return nil, &modelURLRefusalError{msg: fmt.Sprintf("%s URL host is not allowed", role)}
 	}
 	addrs, err := g.s.lookupModelIPs(ctx, normHost)
@@ -2385,7 +2384,7 @@ func (g *modelURLGuard) validateURL(ctx context.Context, rawURL, role string) (*
 		return nil, &modelURLRefusalError{msg: fmt.Sprintf("failed to resolve %s host", role)}
 	}
 	for _, addr := range addrs {
-		if g.s.isBlockedModelAddr(addr, allowPrivate) {
+		if netguard.ModelDialBlocked(addr, pol) {
 			return nil, &modelURLRefusalError{msg: fmt.Sprintf("%s URL host is not allowed", role)}
 		}
 	}

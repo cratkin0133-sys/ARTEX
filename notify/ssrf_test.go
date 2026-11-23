@@ -77,13 +77,23 @@ func TestIsBlockedDialIP(t *testing.T) {
 	blocked := []string{
 		"127.0.0.1", "127.1.2.3", "::1",
 		"169.254.169.254", // cloud metadata endpoint — the main reason this function exists
-		"100.100.100.200",
-		"64:ff9b::a9fe:a9fe", // NAT64 of metadata
-		"64:ff9b::7f00:1",    // NAT64 of loopback
+		"100.100.100.200", // Alibaba Cloud metadata
+		"fd00:ec2::254",   // AWS metadata over IPv6
 		"169.254.1.1", "fe80::1",
 		"0.0.0.0", "::",
 		"224.0.0.1", "ff02::1",
 		"::ffff:127.0.0.1", // the IPv4-mapped form must be converted back before the check, otherwise it is a bypass
+		"::ffff:169.254.169.254",
+		"::ffff:100.100.100.200",
+		// NAT64 (64:ff9b::/96) and 6to4 (2002::/16) addresses reach the IPv4
+		// host they embed, so they are judged as that host.
+		"64:ff9b::a9fe:a9fe", // NAT64 of 169.254.169.254
+		"2002:a9fe:a9fe::1",  // 6to4 of 169.254.169.254
+		"64:ff9b::6464:64c8", // NAT64 of 100.100.100.200
+		"2002:6464:64c8::1",  // 6to4 of 100.100.100.200
+		"64:ff9b::7f00:1",    // NAT64 of 127.0.0.1
+		"2002:7f00:1::",      // 6to4 of 127.0.0.1
+		"64:ff9b::",          // NAT64 of 0.0.0.0
 		"",
 	}
 	for _, s := range blocked {
@@ -96,10 +106,51 @@ func TestIsBlockedDialIP(t *testing.T) {
 	// assertion pins down the trade-off — if someone casually adds a private-net
 	// check in the future, this fails, forcing a conscious decision (instead of
 	// silently killing a batch of deployments).
-	allowed := []string{"10.0.0.5", "172.16.3.4", "192.168.1.10", "8.8.8.8", "2606:4700::1111"}
+	allowed := []string{
+		"10.0.0.5", "172.16.3.4", "192.168.1.10", "8.8.8.8", "2606:4700::1111",
+		"64:ff9b::a00:5",       // NAT64 of 10.0.0.5
+		"64:ff9b::5db8:d822",   // NAT64 of 93.184.216.34
+		"2002:808:808::1",      // 6to4 of 8.8.8.8
+		"64:ff9b::1:a9fe:a9fe", // inside 64:ff9b::/64 but outside the /96 that embeds an IPv4 host
+	}
 	for _, s := range allowed {
 		if isBlockedDialIP(net.ParseIP(s)) {
 			t.Errorf("%s should be allowed (private networks are common legitimate delivery targets)", s)
+		}
+	}
+}
+
+// TestDialGuardRejectsNAT64Metadata covers the connection-layer guard for a
+// name that resolves to a NAT64 or 6to4 form of a metadata or loopback
+// address: the dial is refused by default and allowed once opted in.
+func TestDialGuardRejectsNAT64Metadata(t *testing.T) {
+	refused := []string{
+		"[64:ff9b::a9fe:a9fe]:80",
+		"[2002:a9fe:a9fe::1]:80",
+		"[64:ff9b::6464:64c8]:80",
+		"[::ffff:169.254.169.254]:80",
+		"[fd00:ec2::254]:80",
+		"[64:ff9b::7f00:1]:25",
+	}
+	t.Setenv(AllowLocalTargetsEnv, "")
+	for _, addr := range refused {
+		err := blockInternalDial("tcp", addr, nil)
+		if err == nil {
+			t.Errorf("dial to %s should be refused by default", addr)
+		} else if !strings.Contains(err.Error(), AllowLocalTargetsEnv) {
+			t.Errorf("the refusal for %s should explain how to explicitly opt in: %v", addr, err)
+		}
+	}
+	for _, addr := range []string{"[64:ff9b::5db8:d822]:443", "[64:ff9b::a00:5]:25"} {
+		if err := blockInternalDial("tcp", addr, nil); err != nil {
+			t.Errorf("dial to %s should be allowed: %v", addr, err)
+		}
+	}
+
+	t.Setenv(AllowLocalTargetsEnv, "1")
+	for _, addr := range refused {
+		if err := blockInternalDial("tcp", addr, nil); err != nil {
+			t.Errorf("dial to %s should be allowed once explicitly opted in: %v", addr, err)
 		}
 	}
 }
@@ -113,6 +164,7 @@ func TestValidateHTTPURLRejectsLiteralPrivateTargets(t *testing.T) {
 		"http://127.0.0.1:8080/hook",
 		"http://169.254.169.254/latest/meta-data/",
 		"http://[::1]:8080/hook",
+		"http://[64:ff9b::a9fe:a9fe]/latest/meta-data/",
 	} {
 		if err := validateHTTPURL(raw); err == nil {
 			t.Errorf("%s should be rejected at configuration time", raw)
