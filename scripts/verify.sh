@@ -117,9 +117,8 @@ if want_go; then
       run_step "online index scripts" bash -c '
         set -euo pipefail
         SQL_DSN="${ARTEX_PG_DSN%/*}/artextest_sqlscripts_verify?sslmode=disable"
-        if ! psql "$ARTEX_PG_DSN" -X -tAc "SELECT 1 FROM pg_database WHERE datname = '\''artextest_sqlscripts_verify'\''" | grep -q 1; then
-          psql "$ARTEX_PG_DSN" -X -v ON_ERROR_STOP=1 -c "CREATE DATABASE artextest_sqlscripts_verify"
-        fi
+        psql "$ARTEX_PG_DSN" -X -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS artextest_sqlscripts_verify"
+        psql "$ARTEX_PG_DSN" -X -v ON_ERROR_STOP=1 -c "CREATE DATABASE artextest_sqlscripts_verify"
         psql "$SQL_DSN" -X -q -v ON_ERROR_STOP=1 -f db/schema.sql
         for f in db/migrations/*.sql; do psql "$SQL_DSN" -X -q -v ON_ERROR_STOP=1 -f "$f"; done
         psql "$SQL_DSN" -X -v ON_ERROR_STOP=1 -f scripts/sql/20261115-task-query-indexes.sql
