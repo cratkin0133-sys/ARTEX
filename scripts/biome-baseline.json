@@ -1,0 +1,5 @@
+{
+  "maxErrors": 212,
+  "maxWarnings": 156,
+  "_note": "Ratchet only: lower caps anytime; raising requires explicit review. Switch CI to `npm run check` when maxErrors is 0."
+}

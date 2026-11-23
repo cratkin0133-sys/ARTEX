@@ -10,8 +10,9 @@
 #   --keep-going continue after a failed step and report every failure at the end
 #   -h, --help   show this help
 #
-# The default is the fast set: gofmt, build, vet, tests, web type-check and web
-# unit tests, shellcheck and the shell/python checks. It does not need Docker.
+# The default is the fast set: gofmt, build, vet, tests, web type-check, biome,
+# web unit tests, file-budget ratchet, shellcheck and the shell/python checks.
+# It does not need Docker.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -110,12 +111,22 @@ if want_go; then
   run_step "go test -p 1" go test -p 1 ./...
 
   if [ "$FULL" -eq 1 ]; then
-    RACE_PKGS=(
-      ./agent ./cmd/artex ./config ./db ./evidence ./guard
-      ./intercept ./llmpool ./llmrec ./mcphttp ./notify ./server
-      ./sidequestion ./traffic ./traffic/rewrite
-    )
-    run_step "go test -race -p 1" go test -race -p 1 "${RACE_PKGS[@]}"
+    # Every package in ./... (same as go list ./...). Matches .github/workflows/ci.yml.
+    run_step "go test -race -p 1 ./..." go test -race -p 1 ./...
+    if [ -n "${ARTEX_PG_DSN:-}" ] && command -v psql >/dev/null 2>&1; then
+      run_step "online index scripts" bash -c '
+        set -euo pipefail
+        SQL_DSN="${ARTEX_PG_DSN%/*}/artextest_sqlscripts_verify?sslmode=disable"
+        psql "$ARTEX_PG_DSN" -X -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS artextest_sqlscripts_verify"
+        psql "$ARTEX_PG_DSN" -X -v ON_ERROR_STOP=1 -c "CREATE DATABASE artextest_sqlscripts_verify"
+        psql "$SQL_DSN" -X -q -v ON_ERROR_STOP=1 -f db/schema.sql
+        for f in db/migrations/*.sql; do psql "$SQL_DSN" -X -q -v ON_ERROR_STOP=1 -f "$f"; done
+        psql "$SQL_DSN" -X -v ON_ERROR_STOP=1 -f scripts/sql/20261115-task-query-indexes.sql
+        psql "$SQL_DSN" -X -v ON_ERROR_STOP=1 -f scripts/sql/20261115-task-query-indexes.rollback.sql
+      '
+    else
+      printf 'note: skip online index scripts (need ARTEX_PG_DSN and psql; CI always runs this)\n'
+    fi
   fi
 fi
 
@@ -127,9 +138,12 @@ if want_web; then
     run_step "npm ci" npm --prefix web ci
   fi
   run_step "tsc --noEmit" bash -c 'cd web && npx tsc --noEmit'
+  run_step "biome baseline" bash scripts/check-biome-baseline.sh
   run_step "web polling tests" bash -c 'cd web && npm run test:polling'
   run_step "web replay tests" bash -c 'cd web && npm run test:replay'
   run_step "web upload tests" bash -c 'cd web && npm run test:upload'
+  run_step "web i18n tests" bash -c 'cd web && npm run test:i18n'
+  run_step "web bash tests" bash -c 'cd web && npm run test:bash'
   if [ "$FULL" -eq 1 ]; then
     run_step "web static build" bash -c 'cd web && npm run build:static'
   fi
@@ -138,13 +152,15 @@ fi
 # The shell/python checks are part of neither --go-only nor --web-only: they
 # are cheap and guard the install/update path used by every deployment.
 if [ "$GO_ONLY" -eq 0 ] && [ "$WEB_ONLY" -eq 0 ]; then
+  run_step "file budget" bash scripts/check-file-budget.sh
   require_cmd python3
   if command -v shellcheck >/dev/null 2>&1; then
     run_step "shellcheck" shellcheck -S warning \
       install.sh update.sh start.sh scripts/backup.sh scripts/verify.sh \
       reset-password.sh scripts/extract-changelog-section.sh \
       scripts/test-extract-changelog-section.sh .github/scripts/bot.sh \
-      scripts/test-bot-context.sh
+      scripts/test-bot-context.sh scripts/check-file-budget.sh \
+      scripts/check-biome-baseline.sh
   else
     printf 'note: shellcheck is not installed; skipping the shellcheck step\n'
   fi
